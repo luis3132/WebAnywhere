@@ -19,8 +19,8 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object StreamHub {
 
-    class Track(retainedSegments: Int) {
-        val ring = SegmentRing(retainedSegments)
+    class Track(retainedSegments: Int, maxBytes: Int = Int.MAX_VALUE) {
+        val ring = SegmentRing(retainedSegments, maxBytes)
 
         /** `ftyp` + `moov`, published once the encoder reports its format. */
         @Volatile
@@ -39,11 +39,14 @@ object StreamHub {
         }
     }
 
-    /** ~1 s per segment, so this is an 8 second live window. */
-    val video = Track(retainedSegments = 8)
+    /**
+     * ~100 ms per segment, so a 4 second live window. The byte cap is the real
+     * bound: at an uncapped bitrate a segment can be ten times its usual size,
+     * and counting segments alone would let this grow to tens of megabytes.
+     */
+    val video = Track(retainedSegments = 40, maxBytes = 24 * 1024 * 1024)
 
-    /** Audio segments are shorter; keep a comparable span of wall time. */
-    val audio = Track(retainedSegments = 24)
+    val audio = Track(retainedSegments = 60, maxBytes = 4 * 1024 * 1024)
 
     val mjpeg = MjpegHub()
 

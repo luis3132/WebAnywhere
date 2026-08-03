@@ -113,6 +113,12 @@ class StreamServer(
                 append(",\"codec\":").append(track.codec.jsonOrNull())
                 append(",\"latest\":").append(ring.latest.value)
                 append(",\"oldest\":").append(ring.oldest)
+                // Where a fresh client must start. Segments are cut on a
+                // duration target now, so most of them begin mid-GOP and are
+                // not valid entry points.
+                append(",\"joinAt\":").append(
+                    if (ring.latestSync >= 0) ring.latestSync else ring.latest.value,
+                )
                 append(",\"segments\":").append(ring.size)
                 append('}')
             },
@@ -164,7 +170,10 @@ class StreamServer(
         fmp4Leases.touch(call.remoteHost(), Profile.FMP4, call.userAgent())
         awaitReady(StreamHub.video)
 
+        // A playlist has to begin on a key frame, or the first thing the player
+        // decodes is a fragment with nothing to reference.
         val segments = StreamHub.video.ring.snapshot()
+            .dropWhile { !it.isSync }
         if (segments.isEmpty()) {
             call.respondText("no segments yet", status = HttpStatusCode.ServiceUnavailable)
             return

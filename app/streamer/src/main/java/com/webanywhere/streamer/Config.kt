@@ -50,8 +50,20 @@ data class StreamConfig(
     val imageQuality: ImageQuality = ImageQuality.HIGH,
     /** Null derives it from resolution, frame rate and [imageQuality]. */
     val videoBitrate: Int? = null,
-    /** Key frame cadence. Also the segment length, since segments cut on key frames. */
+    /**
+     * Key frame cadence. Sets how long a *joining* client waits, not the
+     * latency of one already watching — those were the same thing until
+     * segments stopped being tied to key frames.
+     */
     val keyFrameIntervalSec: Int = 1,
+
+    /**
+     * Media segment length, and the dominant term in end-to-end latency: a
+     * segment cannot be sent until it is closed. 100 ms puts the fMP4 path in
+     * the same league as the MJPEG one, at the cost of ~10 requests per second
+     * per track — nothing on a LAN.
+     */
+    val segmentTargetMs: Int = 100,
 
     // --- MJPEG profile ---
     /** Deliberately smaller: JPEG has no inter-frame compression to lean on. */
@@ -70,5 +82,5 @@ data class StreamConfig(
     val videoHeight: Int get() = quality.maxHeight
 
     /** Microsecond target used by the segmenter. */
-    val segmentTargetUs: Long get() = keyFrameIntervalSec * 1_000_000L
+    val segmentTargetUs: Long get() = segmentTargetMs * 1_000L
 }

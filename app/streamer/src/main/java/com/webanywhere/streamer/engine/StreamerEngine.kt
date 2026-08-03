@@ -189,8 +189,10 @@ class StreamerEngine(
             trackId = Fmp4.TRACK_VIDEO,
             timescale = VIDEO_TIMESCALE,
             targetSegmentUs = config.segmentTargetUs,
-        ) { sequence, data, durationUs ->
-            StreamHub.video.ring.add(SegmentRing.Segment(sequence, data, durationUs))
+        ) { sequence, data, durationUs, startsWithSync ->
+            StreamHub.video.ring.add(
+                SegmentRing.Segment(sequence, data, durationUs, startsWithSync),
+            )
             StreamHub.updateStats { it.copy(videoSegments = it.videoSegments + 1) }
         }
 
@@ -315,12 +317,14 @@ class StreamerEngine(
         val track = Fmp4Track(
             trackId = Fmp4.TRACK_AUDIO,
             timescale = config.audioSampleRate,
-            targetSegmentUs = AUDIO_SEGMENT_US,
+            targetSegmentUs = config.segmentTargetUs,
             // Every AAC-LC frame is exactly 1024 samples, so durations are
             // exact and no frame needs to be held back to learn its length.
             fixedSampleDurationTicks = AAC_FRAME_SAMPLES,
-        ) { sequence, data, durationUs ->
-            StreamHub.audio.ring.add(SegmentRing.Segment(sequence, data, durationUs))
+        ) { sequence, data, durationUs, startsWithSync ->
+            StreamHub.audio.ring.add(
+                SegmentRing.Segment(sequence, data, durationUs, startsWithSync),
+            )
         }
 
         val encoder = AudioEncoder(
@@ -446,7 +450,6 @@ class StreamerEngine(
         const val VIDEO_TIMESCALE = 1_000_000
 
         const val AAC_FRAME_SAMPLES = 1024
-        const val AUDIO_SEGMENT_US = 500_000L
 
         /** Survive a page reload without tearing the encoder down and back up. */
         const val IDLE_GRACE_MS = 15_000L

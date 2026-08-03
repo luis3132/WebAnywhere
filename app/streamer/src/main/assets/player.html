@@ -328,7 +328,7 @@
          que mantiene audio y video alineados cuando un cliente entra a
          mitad de la emision. */
       videoBuffer.mode = 'segments';
-      runTrack(videoBuffer, '/v/', videoInfo.latest);
+      runTrack(videoBuffer, '/v/', joinPoint(videoInfo));
       setHud('fMP4 ' + (videoInfo.codec || ''));
 
       if (audioInfo) {
@@ -336,7 +336,7 @@
         if (window.MediaSource.isTypeSupported(audioMime)) {
           var audioBuffer = ms.addSourceBuffer(audioMime);
           audioBuffer.mode = 'segments';
-          runTrack(audioBuffer, '/a/', audioInfo.latest);
+          runTrack(audioBuffer, '/a/', joinPoint(audioInfo));
           video.muted = false;
         }
       }
@@ -410,7 +410,7 @@
     function resync() {
       xhrJson(base + 'live.json', function (status, info) {
         if (status === 200 && info && info.latest >= 0) {
-          next = info.latest;
+          next = joinPoint(info);
           loop();
         } else {
           setTimeout(resync, 500);
@@ -419,22 +419,41 @@
     }
   }
 
-  /* Vigilante del borde en vivo: si el buffer se acumula, saltamos hacia
-     delante. En directo, llegar tarde es peor que perder unos fotogramas. */
+  /* Los segmentos se cortan por duracion, no por fotograma clave, asi que
+     la mayoria empieza a mitad de GOP y no sirve como punto de entrada. El
+     servidor dice cual es el ultimo valido. */
+  function joinPoint(info) {
+    if (!info) { return 0; }
+    if (typeof info.joinAt === 'number' && info.joinAt >= 0) { return info.joinAt; }
+    return info.latest;
+  }
+
+  /* Vigilante del borde en vivo. En directo, llegar tarde es peor que
+     perder fotogramas: el retraso no se recupera solo, se acumula. Los
+     margenes son ajustados a proposito — con segmentos de 100 ms, tolerar
+     varios segundos de buffer tiraria por la borda todo lo que se gana
+     acortandolos. */
+  var TARGET_LAG = 0.25;   /* a donde saltamos: casi el borde */
+  var MAX_LAG    = 0.60;   /* a partir de aqui, saltamos */
+
   setInterval(function () {
-    if (useMjpeg) { return; }
+    if (useMjpeg || connectionLost) { return; }
     try {
       if (video.buffered.length === 0) { return; }
       var end = video.buffered.end(video.buffered.length - 1);
       var start = video.buffered.start(0);
+      var lag = end - video.currentTime;
 
-      if (video.currentTime < start) { video.currentTime = start; }
-      else if (end - video.currentTime > 4) { video.currentTime = end - 0.5; }
+      if (video.currentTime < start) {
+        video.currentTime = start;
+      } else if (lag > MAX_LAG) {
+        video.currentTime = end - TARGET_LAG;
+      }
 
       if (video.paused) { tryPlay(); }
-      setHud('fMP4 · buffer ' + (end - video.currentTime).toFixed(1) + 's');
+      setHud('fMP4 · ' + Math.round(lag * 1000) + ' ms');
     } catch (e) { /* aun sin datos */ }
-  }, 2000);
+  }, 500);
 
   function tryPlay() {
     try {

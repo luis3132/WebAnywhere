@@ -76,8 +76,14 @@ class Fmp4MuxerTest {
         }
     }
 
+    /**
+     * Segment length is decoupled from key frame cadence — that decoupling is
+     * what buys the low latency, and getting it wrong is silent: the stream
+     * still plays for whoever was watching from the start, and shows nothing at
+     * all to anyone who joins later.
+     */
     @Test
-    fun `segments are cut on key frames so a late client can always join`() {
+    fun `segments are cut on time but only key frame ones are entry points`() {
         assumeTrue("ffmpeg not available", hasTool("ffmpeg"))
 
         val work = File(System.getProperty("java.io.tmpdir"), "fmp4-key-${System.nanoTime()}")
@@ -87,20 +93,36 @@ class Fmp4MuxerTest {
             val annexB = generateAnnexB(work)
             val accessUnits = splitAccessUnits(annexB)
             val (sps, pps) = requireNotNull(AnnexB.spsPps(annexB))
+            val keyFrames = accessUnits.count { isKeyFrame(it) }
+            assertTrue("test stream needs several key frames", keyFrames >= 2)
 
             val segments = mutableListOf<ByteArray>()
+            val syncFlags = mutableListOf<Boolean>()
             val track = Fmp4Track(
                 trackId = Fmp4.TRACK_VIDEO,
                 timescale = timescale,
-                targetSegmentUs = 1_000_000L,
-            ) { _, data, _ -> segments.add(data) }
+                targetSegmentUs = 100_000L,
+            ) { _, data, _, startsWithSync ->
+                segments.add(data)
+                syncFlags.add(startsWithSync)
+            }
 
             accessUnits.forEachIndexed { index, unit ->
                 track.push(AnnexB.toAvcc(unit), index * frameDurationUs, isKeyFrame(unit))
             }
             track.flush()
 
-            assertTrue("expected several segments, got ${segments.size}", segments.size >= 2)
+            // Decoupled: far more segments than key frames, or the 100 ms
+            // target is being ignored and latency is back to one GOP.
+            assertTrue(
+                "expected many short segments, got ${segments.size} for $keyFrames key frames",
+                segments.size > keyFrames * 2,
+            )
+
+            // Exactly the key frames are entry points — no more (which would
+            // send a joining client into the middle of a GOP), no fewer.
+            assertEquals(keyFrames, syncFlags.count { it })
+            assertTrue("the first segment must be joinable", syncFlags.first())
 
             // Every segment must start with styp/moof, i.e. be independently
             // fetchable rather than a continuation of the previous one.
@@ -129,7 +151,7 @@ class Fmp4MuxerTest {
             trackId = Fmp4.TRACK_VIDEO,
             timescale = timescale,
             targetSegmentUs = 1_000_000L,
-        ) { _, data, _ -> out.write(data) }
+        ) { _, data, _, _ -> out.write(data) }
 
         accessUnits.forEachIndexed { index, unit ->
             track.push(AnnexB.toAvcc(unit), index * frameDurationUs, isKeyFrame(unit))

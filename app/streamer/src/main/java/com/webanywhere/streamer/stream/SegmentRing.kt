@@ -18,16 +18,23 @@ import kotlinx.coroutines.withTimeout
  * the state flow until the encoder produces it. One request, one segment, no
  * spinning.
  */
-class SegmentRing(private val capacity: Int) {
+class SegmentRing(private val capacity: Int, private val maxBytes: Int = Int.MAX_VALUE) {
 
     class Segment(
         val sequence: Long,
         val data: ByteArray,
         val durationUs: Long,
+        /**
+         * Whether this segment begins with a key frame. Only these are valid
+         * entry points: a client that starts mid-GOP has nothing to decode
+         * against and shows a green mess or nothing at all.
+         */
+        val isSync: Boolean = true,
     )
 
     private val lock = Any()
     private val items = ArrayDeque<Segment>(capacity)
+    private var bytes = 0L
 
     private val _latest = MutableStateFlow(-1L)
 
@@ -38,13 +45,30 @@ class SegmentRing(private val capacity: Int) {
     var oldest: Long = -1L
         private set
 
+    /** Newest segment a fresh client can start from. -1 if there is none yet. */
+    @Volatile
+    var latestSync: Long = -1L
+        private set
+
     val size: Int get() = synchronized(lock) { items.size }
 
     fun add(segment: Segment) {
         synchronized(lock) {
             items.addLast(segment)
-            while (items.size > capacity) items.removeFirst()
+            bytes += segment.data.size
+
+            // Bounded by count *and* by bytes: at an uncapped bitrate a segment
+            // can be an order of magnitude larger than expected, and a
+            // count-only bound would quietly turn into tens of megabytes.
+            while (items.size > capacity || (bytes > maxBytes && items.size > 2)) {
+                bytes -= items.removeFirst().data.size
+            }
             oldest = items.first().sequence
+
+            if (segment.isSync) latestSync = segment.sequence
+            if (latestSync < oldest) {
+                latestSync = items.firstOrNull { it.isSync }?.sequence ?: -1L
+            }
         }
         _latest.value = segment.sequence
     }
@@ -59,7 +83,9 @@ class SegmentRing(private val capacity: Int) {
     fun clear() {
         synchronized(lock) {
             items.clear()
+            bytes = 0
             oldest = -1L
+            latestSync = -1L
         }
         _latest.value = -1L
     }
