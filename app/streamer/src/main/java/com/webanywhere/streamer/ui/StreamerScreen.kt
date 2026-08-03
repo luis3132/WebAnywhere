@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.webanywhere.streamer.ImageQuality
+import com.webanywhere.streamer.Latency
 import com.webanywhere.streamer.Quality
 import com.webanywhere.streamer.StreamConfig
 import com.webanywhere.streamer.StreamHub
@@ -324,6 +325,26 @@ private fun QualityCard(enabled: Boolean) {
                     enabled = enabled,
                 ) { StreamHub.config = config.copy(videoFps = fps) }
             }
+        }
+
+        Spacer(Modifier.height(4.dp))
+        Text("Latencia", fontSize = 12.sp, color = Color(0xFF9A9AA6))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Latency.entries.forEach { latency ->
+                Choice(
+                    label = latency.label,
+                    selected = config.latency == latency,
+                    enabled = enabled,
+                ) { StreamHub.config = config.copy(latency = latency) }
+            }
+        }
+        if (enabled && config.latency == Latency.INSTANT) {
+            Text(
+                "100 ms son ~20 peticiones por segundo. Si el navegador del " +
+                    "vehículo se atraganta, sube a 250 ms.",
+                fontSize = 11.sp,
+                color = Color(0xFF9A9AA6),
+            )
         }
 
         Spacer(Modifier.height(4.dp))

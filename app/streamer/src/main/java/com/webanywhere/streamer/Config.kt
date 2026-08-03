@@ -15,6 +15,22 @@ enum class Quality(val label: String, val maxWidth: Int, val maxHeight: Int) {
 }
 
 /**
+ * Segment length, which is the dominant term in end-to-end latency because a
+ * segment cannot be sent until it is closed.
+ *
+ * Shorter is not free: each segment is one HTTP request per track, so 100 ms
+ * means roughly twenty requests a second with audio on. A modern browser does
+ * not notice; an old head unit WebView might, and it is not something the user
+ * could change from inside the car.
+ */
+enum class Latency(val label: String, val segmentMs: Int) {
+    INSTANT("100 ms", 100),
+    BALANCED("250 ms", 250),
+    /** For WebViews that cannot keep up with the request rate. */
+    RELAXED("500 ms", 500),
+}
+
+/**
  * How many bits to spend per pixel per frame.
  *
  * These are far above what a streaming service would use, on purpose: this runs
@@ -51,19 +67,18 @@ data class StreamConfig(
     /** Null derives it from resolution, frame rate and [imageQuality]. */
     val videoBitrate: Int? = null,
     /**
-     * Key frame cadence. Sets how long a *joining* client waits, not the
-     * latency of one already watching — those were the same thing until
-     * segments stopped being tied to key frames.
+     * Key frame cadence, and therefore how close to the live edge a client can
+     * *land* when it joins or resynchronises — it has to start on a key frame,
+     * so the newest one is the freshest possible entry point.
+     *
+     * 500 ms rather than the usual second because falling behind is answered by
+     * jumping to the live edge, and a jump that lands a second in the past is
+     * not a recovery. Extra key frames cost bits, which on a LAN is the cheap
+     * side of the trade.
      */
-    val keyFrameIntervalSec: Int = 1,
+    val keyFrameIntervalMs: Int = 500,
 
-    /**
-     * Media segment length, and the dominant term in end-to-end latency: a
-     * segment cannot be sent until it is closed. 100 ms puts the fMP4 path in
-     * the same league as the MJPEG one, at the cost of ~10 requests per second
-     * per track — nothing on a LAN.
-     */
-    val segmentTargetMs: Int = 100,
+    val latency: Latency = Latency.INSTANT,
 
     // --- MJPEG profile ---
     /** Deliberately smaller: JPEG has no inter-frame compression to lean on. */
@@ -82,5 +97,5 @@ data class StreamConfig(
     val videoHeight: Int get() = quality.maxHeight
 
     /** Microsecond target used by the segmenter. */
-    val segmentTargetUs: Long get() = segmentTargetMs * 1_000L
+    val segmentTargetUs: Long get() = latency.segmentMs * 1_000L
 }

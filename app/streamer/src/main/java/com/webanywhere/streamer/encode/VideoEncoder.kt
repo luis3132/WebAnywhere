@@ -29,7 +29,7 @@ class VideoEncoder(
     private val height: Int,
     private val fps: Int,
     private val bitrate: Int,
-    private val keyFrameIntervalSec: Int,
+    private val keyFrameIntervalMs: Int,
     /** Resolved by [VideoCaps]; null lets the encoder choose. */
     private val level: Int? = null,
     private val onFormat: (sps: ByteArray, pps: ByteArray) -> Unit,
@@ -123,7 +123,18 @@ class VideoEncoder(
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, keyFrameIntervalSec)
+
+            if (strict) {
+                // Sub-second key frame intervals need the float form, which has
+                // been accepted since API 25. The fallback below rounds up to
+                // whole seconds for encoders that only take the integer key.
+                setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, keyFrameIntervalMs / 1000f)
+            } else {
+                setInteger(
+                    MediaFormat.KEY_I_FRAME_INTERVAL,
+                    ((keyFrameIntervalMs + 999) / 1000).coerceAtLeast(1),
+                )
+            }
 
             if (strict) {
                 setInteger(
@@ -196,7 +207,9 @@ class VideoEncoder(
             return
         }
 
-        val avcc = AnnexB.toAvcc(bytes)
+        // In place when possible — this runs 60 times a second and the naive
+        // conversion allocates several copies of the frame each time.
+        val avcc = AnnexB.toAvccInPlace(bytes) ?: AnnexB.toAvcc(bytes)
         if (avcc.isEmpty()) return
 
         val isSync = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0

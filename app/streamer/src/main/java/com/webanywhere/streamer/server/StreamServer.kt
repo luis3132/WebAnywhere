@@ -152,6 +152,11 @@ class StreamServer(
                 // Segments are immutable once produced, so caching is safe and
                 // spares the link a retransmit if the client re-requests one.
                 call.response.header(HttpHeaders.CacheControl, "public, max-age=300")
+                // How far behind the client is, at the cost of no extra round
+                // trip. Without this it would have to poll live.json to find
+                // out, and by the time it knew it would be further behind.
+                call.response.header(LIVE_LATEST, track.ring.latest.value.toString())
+                call.response.header(LIVE_JOIN, track.ring.latestSync.toString())
                 call.respondBytes(result.segment.data, MP4)
             }
 
@@ -392,6 +397,10 @@ class StreamServer(
 
         /** How long a segment request parks waiting for the encoder to produce it. */
         const val SEGMENT_WAIT_MS = 10_000L
+
+        /** Live edge, piggybacked on every segment so the client never polls. */
+        const val LIVE_LATEST = "X-Live-Latest"
+        const val LIVE_JOIN = "X-Live-Join"
         const val READY_WAIT_MS = 6_000L
 
         /** A client quiet for this long is assumed gone. */

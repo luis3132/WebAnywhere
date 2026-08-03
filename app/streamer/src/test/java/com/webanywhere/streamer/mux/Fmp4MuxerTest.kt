@@ -1,5 +1,6 @@
 package com.webanywhere.streamer.mux
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -136,6 +137,40 @@ class Fmp4MuxerTest {
             assertTrue("init segment lacks moov", indexOf(init, "moov") > 0)
             assertTrue("init segment lacks avcC", indexOf(init, "avcC") > 0)
             assertTrue("init segment lacks mvex", indexOf(init, "mvex") > 0)
+        } finally {
+            work.deleteRecursively()
+        }
+    }
+
+    /**
+     * The in-place conversion trades safety for allocations, so it is worth
+     * proving it produces exactly what the straightforward version does. A
+     * mistake here would not throw: it would emit a plausible stream that
+     * decodes to garbage.
+     */
+    @Test
+    fun `in-place AVCC conversion matches the allocating one byte for byte`() {
+        assumeTrue("ffmpeg not available", hasTool("ffmpeg"))
+
+        val work = File(System.getProperty("java.io.tmpdir"), "avcc-${System.nanoTime()}")
+        work.mkdirs()
+
+        try {
+            val accessUnits = splitAccessUnits(generateAnnexB(work))
+            var fastPath = 0
+
+            accessUnits.forEach { unit ->
+                val expected = AnnexB.toAvcc(unit)
+                // The fast path mutates what it is given, so hand it a copy.
+                val actual = AnnexB.toAvccInPlace(unit.copyOf()) ?: return@forEach
+                fastPath++
+                assertArrayEquals("in-place conversion diverged", expected, actual)
+            }
+
+            assertTrue(
+                "the fast path never engaged, so it is not being exercised",
+                fastPath > accessUnits.size / 2,
+            )
         } finally {
             work.deleteRecursively()
         }

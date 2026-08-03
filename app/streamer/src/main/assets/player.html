@@ -376,6 +376,8 @@
       } catch (e) { /* la siguiente ronda lo reintenta */ }
     }
 
+    sourceBuffer.addEventListener('updateend', trimToLiveEdge);
+
     xhrBin(base + 'init.mp4', function (status, buffer) {
       if (status !== 200 || !buffer) {
         setTimeout(function () { runTrack(sourceBuffer, base, startSequence); }, 500);
@@ -387,11 +389,24 @@
     });
 
     function loop() {
-      xhrBin(base + 'seg/' + next + '.m4s', function (status, buffer) {
+      xhrBin(base + 'seg/' + next + '.m4s', function (status, buffer, xhr) {
         if (status === 200 && buffer) {
           queue.push(buffer);
           pump();
           next = next + 1;
+
+          /* Esto es directo: los fotogramas que no se alcanzaron a pintar
+             no se deben, y entregarlos tarde solo retrasa tambien a todos
+             los siguientes. Si nos quedamos atras, saltamos al ultimo
+             punto de entrada y lo de en medio se pierde. El servidor manda
+             el borde en la propia respuesta, asi que enterarse no cuesta
+             ni una peticion extra. */
+          var latest = headerNumber(xhr, 'X-Live-Latest');
+          var join = headerNumber(xhr, 'X-Live-Join');
+          if (latest >= 0 && (latest - next) > MAX_LAG_SEGMENTS && join > next) {
+            next = join;
+          }
+
           loop();
           return;
         }
@@ -433,25 +448,35 @@
      margenes son ajustados a proposito — con segmentos de 100 ms, tolerar
      varios segundos de buffer tiraria por la borda todo lo que se gana
      acortandolos. */
-  var TARGET_LAG = 0.25;   /* a donde saltamos: casi el borde */
-  var MAX_LAG    = 0.60;   /* a partir de aqui, saltamos */
+  var TARGET_LAG = 0.15;   /* a donde saltamos: segundo y medio de segmento */
+  var MAX_LAG    = 0.35;   /* a partir de aqui, saltamos */
+  var MAX_LAG_SEGMENTS = 3;
+
+  /* Se llama en cada updateend, no solo cada pocos cientos de ms: el
+     retraso se corrige en cuanto aparece, no en la siguiente ronda. */
+  function trimToLiveEdge() {
+    if (useMjpeg || connectionLost) { return; }
+    try {
+      if (video.buffered.length === 0) { return; }
+      var end = video.buffered.end(video.buffered.length - 1);
+      var start = video.buffered.start(0);
+
+      if (video.currentTime < start) {
+        video.currentTime = start;
+      } else if (end - video.currentTime > MAX_LAG) {
+        video.currentTime = end - TARGET_LAG;
+      }
+    } catch (e) { /* aun sin datos */ }
+  }
 
   setInterval(function () {
     if (useMjpeg || connectionLost) { return; }
     try {
       if (video.buffered.length === 0) { return; }
       var end = video.buffered.end(video.buffered.length - 1);
-      var start = video.buffered.start(0);
-      var lag = end - video.currentTime;
-
-      if (video.currentTime < start) {
-        video.currentTime = start;
-      } else if (lag > MAX_LAG) {
-        video.currentTime = end - TARGET_LAG;
-      }
-
+      trimToLiveEdge();
       if (video.paused) { tryPlay(); }
-      setHud('fMP4 · ' + Math.round(lag * 1000) + ' ms');
+      setHud('fMP4 · ' + Math.round((end - video.currentTime) * 1000) + ' ms');
     } catch (e) { /* aun sin datos */ }
   }, 500);
 
@@ -469,10 +494,19 @@
     xhr.open('GET', url, true);
     try { xhr.responseType = 'arraybuffer'; } catch (e) { /* XHR1 */ }
     xhr.onreadystatechange = function () {
-      if (xhr.readyState === 4) { callback(xhr.status, xhr.response); }
+      if (xhr.readyState === 4) { callback(xhr.status, xhr.response, xhr); }
     };
-    xhr.onerror = function () { callback(0, null); };
+    xhr.onerror = function () { callback(0, null, null); };
     xhr.send(null);
+  }
+
+  function headerNumber(xhr, name) {
+    if (!xhr) { return -1; }
+    var raw;
+    try { raw = xhr.getResponseHeader(name); } catch (e) { return -1; }
+    if (!raw) { return -1; }
+    var value = parseInt(raw, 10);
+    return isNaN(value) ? -1 : value;
   }
 
   function xhrJson(url, callback) {

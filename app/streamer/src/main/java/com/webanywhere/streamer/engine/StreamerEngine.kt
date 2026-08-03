@@ -201,7 +201,7 @@ class StreamerEngine(
             height = height,
             fps = target.fps,
             bitrate = target.bitrate,
-            keyFrameIntervalSec = config.keyFrameIntervalSec,
+            keyFrameIntervalMs = config.keyFrameIntervalMs,
             level = target.level,
             onFormat = { sps, pps ->
                 StreamHub.video.initSegment = Fmp4.videoInit(sps, pps, width, height, VIDEO_TIMESCALE)

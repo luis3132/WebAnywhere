@@ -40,13 +40,22 @@ object StreamHub {
     }
 
     /**
-     * ~100 ms per segment, so a 4 second live window. The byte cap is the real
-     * bound: at an uncapped bitrate a segment can be ten times its usual size,
-     * and counting segments alone would let this grow to tens of megabytes.
+     * ~100 ms per segment, so roughly a one second window — and that window
+     * *is* the deadline.
+     *
+     * Nothing older than about a second can even be asked for: it has been
+     * evicted, and the request gets a 410 that sends the client to the live
+     * edge. That is the intended behaviour rather than a limitation. This is
+     * live video: a frame the client did not render in time is not owed to it,
+     * and delivering it late only pushes every later frame later too.
+     *
+     * The byte cap is the bound that actually matters, because at an uncapped
+     * bitrate a segment can be ten times its usual size. Counting segments
+     * alone would silently turn into tens of megabytes.
      */
-    val video = Track(retainedSegments = 40, maxBytes = 24 * 1024 * 1024)
+    val video = Track(retainedSegments = 12, maxBytes = 4 * 1024 * 1024)
 
-    val audio = Track(retainedSegments = 60, maxBytes = 4 * 1024 * 1024)
+    val audio = Track(retainedSegments = 12, maxBytes = 512 * 1024)
 
     val mjpeg = MjpegHub()
 
