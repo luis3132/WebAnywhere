@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>WebAnywhere Streamer</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#000; overflow:hidden;
+               font-family: Arial, Helvetica, sans-serif; color:#e8e8ec; }
+  #stage { position:absolute; top:0; left:0; right:0; bottom:0; background:#000; }
+  #v, #m { position:absolute; top:0; left:0; width:100%; height:100%;
+           display:none; background:#000; }
+  #v { object-fit:contain; }
+  #m { object-fit:contain; }
+
+  #overlay { position:absolute; top:0; left:0; right:0; bottom:0;
+             background:#101014; text-align:center; }
+  #inner { position:absolute; top:50%; left:0; right:0; margin-top:-110px; }
+  h1 { font-size:22px; color:#7ce7c7; margin:0 0 6px 0; }
+  #status { font-size:14px; color:#9a9aa6; margin:0 0 24px 0; min-height:20px; }
+  #start { font-size:24px; font-weight:bold; padding:20px 56px;
+           background:#7ce7c7; color:#101014; border:0; border-radius:10px;
+           cursor:pointer; }
+  #links { position:absolute; bottom:14px; left:0; right:0; font-size:13px; }
+  #links a { color:#7ce7c7; margin:0 10px; text-decoration:none; }
+
+  #hud { position:absolute; left:10px; bottom:10px; font-size:12px;
+         color:#7ce7c7; background:rgba(0,0,0,0.55); padding:5px 9px;
+         border-radius:6px; display:none; z-index:20; }
+
+  /* Botones grandes a proposito: el dedo va sobre una pantalla tactil de
+     coche, a veces en movimiento. */
+  .btn { font-family:inherit; font-size:16px; padding:12px 20px; cursor:pointer;
+         background:rgba(16,16,20,0.78); color:#7ce7c7; border-radius:9px;
+         border:1px solid rgba(124,231,199,0.55); }
+  #fsBtn { position:absolute; right:14px; top:14px; z-index:25; display:none; }
+  #exitFs { position:absolute; left:0; right:0; top:14px; z-index:30;
+            display:none; text-align:center; }
+
+  #ended { position:absolute; top:0; left:0; right:0; bottom:0; z-index:40;
+           background:#101014; text-align:center; display:none; }
+  #endedInner { position:absolute; top:50%; left:0; right:0; margin-top:-120px; }
+  #endedIcon { font-size:52px; color:#ff8a80; margin:0 0 10px 0; }
+  #endedTitle { font-size:24px; font-weight:bold; margin:0 0 8px 0; }
+  #endedText { font-size:15px; color:#9a9aa6; margin:0 0 26px 0; }
+  #retryBtn { font-size:20px; padding:16px 44px; background:#7ce7c7;
+              color:#101014; border:0; border-radius:10px; cursor:pointer;
+              font-family:inherit; font-weight:bold; }
+  #endedHint { font-size:13px; color:#6a6a76; margin:18px 0 0 0; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="v" playsinline webkit-playsinline muted></video>
+  <img id="m" alt="">
+  <div id="hud"></div>
+  <button id="fsBtn" class="btn" type="button">Pantalla completa</button>
+  <div id="exitFs"><button id="exitFsBtn" class="btn" type="button">Salir de pantalla completa</button></div>
+</div>
+
+<div id="ended">
+  <div id="endedInner">
+    <p id="endedIcon">&#9888;</p>
+    <p id="endedTitle">Se cerro la conexion</p>
+    <p id="endedText">El telefono dejo de transmitir.</p>
+    <button id="retryBtn" type="button">Reintentar</button>
+    <p id="endedHint">Reintentando automaticamente...</p>
+  </div>
+</div>
+
+<div id="overlay">
+  <div id="inner">
+    <h1>WebAnywhere Streamer</h1>
+    <p id="status">Detectando capacidades...</p>
+    <!-- Boton grande a proposito: casi ningun WebView deja arrancar un
+         <video> sin un gesto del usuario, y el dedo va sobre una pantalla
+         tactil de coche. -->
+    <button id="start" type="button">Reproducir</button>
+  </div>
+  <div id="links">
+    <a href="/?p=mse">Forzar fMP4</a>
+    <a href="/?p=mjpeg">Forzar MJPEG</a>
+    <a href="/probe">Diagnostico</a>
+  </div>
+</div>
+
+<script>
+/* ES5 estricto por compatibilidad: nada de const/let, arrow functions,
+   template literals, fetch, Promise ni modulos. Solo XHR2 y MSE, que es
+   exactamente lo que YouTube web necesita y por tanto lo que este
+   navegador ya demostro tener. */
+(function () {
+
+  var video   = document.getElementById('v');
+  var img     = document.getElementById('m');
+  var overlay = document.getElementById('overlay');
+  var statusEl= document.getElementById('status');
+  var startBtn= document.getElementById('start');
+  var hud     = document.getElementById('hud');
+  var stage   = document.getElementById('stage');
+  var fsBtn   = document.getElementById('fsBtn');
+  var exitWrap= document.getElementById('exitFs');
+  var exitBtn = document.getElementById('exitFsBtn');
+  var ended   = document.getElementById('ended');
+  var endedText = document.getElementById('endedText');
+  var retryBtn= document.getElementById('retryBtn');
+
+  var playing = false;
+  var connectionLost = false;
+
+  var query   = parseQuery();
+  var forced  = query.p || '';
+  var wantAudio = query.audio !== '0';
+  var hudOn   = query.hud === '1';
+
+  var hasMse  = !!window.MediaSource;
+  var useMjpeg = (forced === 'mjpeg') || (forced !== 'mse' && !hasMse);
+
+  setStatus(useMjpeg
+    ? 'Perfil B (MJPEG). Compatible con todo.'
+    : 'Perfil A (fMP4 + MSE). Maxima calidad.');
+
+  startBtn.onclick = function () {
+    overlay.style.display = 'none';
+    playing = true;
+    if (hudOn) { hud.style.display = 'block'; }
+    syncFsUi();
+    startHeartbeat();
+    if (useMjpeg) { startMjpeg(); } else { startMse(); }
+  };
+
+  /* ------------------------------------------------ pantalla completa */
+
+  /* La API de pantalla completa lleva prefijo distinto segun la epoca del
+     WebView, y en algunos no existe. Se prueban todas y, si no hay
+     ninguna, el boton no se muestra: mas vale ningun boton que uno que
+     no hace nada. */
+  function fsRequestFn() {
+    var e = document.documentElement;
+    return e.requestFullscreen || e.webkitRequestFullscreen ||
+           e.webkitRequestFullScreen || e.mozRequestFullScreen ||
+           e.msRequestFullscreen || null;
+  }
+
+  function fsExitFn() {
+    return document.exitFullscreen || document.webkitExitFullscreen ||
+           document.webkitCancelFullScreen || document.mozCancelFullScreen ||
+           document.msExitFullscreen || null;
+  }
+
+  function fsActive() {
+    return !!(document.fullscreenElement || document.webkitFullscreenElement ||
+              document.mozFullScreenElement || document.msFullscreenElement);
+  }
+
+  function enterFs() {
+    var fn = fsRequestFn();
+    if (!fn) { return; }
+    try { fn.call(document.documentElement); } catch (e) { /* denegado */ }
+  }
+
+  function leaveFs() {
+    var fn = fsExitFn();
+    if (!fn) { return; }
+    try { fn.call(document); } catch (e) { /* ya fuera */ }
+  }
+
+  function syncFsUi() {
+    var inFs = fsActive();
+    fsBtn.style.display =
+      (playing && !connectionLost && !inFs && !!fsRequestFn()) ? 'block' : 'none';
+    if (!inFs) { hideExit(); }
+  }
+
+  var exitTimer = null;
+
+  function showExit() {
+    exitWrap.style.display = 'block';
+    if (exitTimer) { clearTimeout(exitTimer); }
+    exitTimer = setTimeout(hideExit, 4000);
+  }
+
+  function hideExit() {
+    exitWrap.style.display = 'none';
+    if (exitTimer) { clearTimeout(exitTimer); exitTimer = null; }
+  }
+
+  fsBtn.onclick = function () { enterFs(); };
+  exitBtn.onclick = function () { leaveFs(); };
+
+  /* En pantalla completa no queda ningun control a la vista, asi que el
+     propio video es el que responde al toque. */
+  stage.onclick = function (ev) {
+    var target = ev && (ev.target || ev.srcElement);
+    if (target && target.tagName === 'BUTTON') { return; }
+    if (!fsActive()) { return; }
+    if (exitWrap.style.display === 'block') { hideExit(); } else { showExit(); }
+  };
+
+  var fsEvents = ['fullscreenchange', 'webkitfullscreenchange',
+                  'mozfullscreenchange', 'MSFullscreenChange'];
+  for (var fi = 0; fi < fsEvents.length; fi++) {
+    if (document.addEventListener) {
+      document.addEventListener(fsEvents[fi], syncFsUi, false);
+    }
+  }
+
+  /* ------------------------------------------- fin de la transmision */
+
+  /* Un latido contra /status. Sirve para los dos perfiles: un multipart
+     que se corta no siempre dispara onerror, y un <video> alimentado por
+     MSE simplemente se queda congelado sin avisar. */
+  function startHeartbeat() {
+    var misses = 0;
+    setInterval(function () {
+      xhrJson('/status', function (status, info) {
+        if (status === 200) {
+          misses = 0;
+          /* El telefono volvio: recargar es la forma mas limpia de
+             reengancharse, porque toda la sesion de MSE quedo invalida. */
+          if (connectionLost) { window.location.reload(); return; }
+          if (info && info.running === false) { showEnded('La transmision se detuvo en el telefono.'); }
+          return;
+        }
+        misses = misses + 1;
+        /* Dos fallos seguidos, no uno: un XHR perdido en un salto de
+           canal Wi-Fi no es una desconexion. */
+        if (misses >= 2) { showEnded('El telefono dejo de transmitir.'); }
+      });
+    }, 3000);
+  }
+
+  function showEnded(reason) {
+    if (connectionLost) { return; }
+    connectionLost = true;
+
+    endedText.innerHTML = '';
+    endedText.appendChild(document.createTextNode(reason));
+
+    hideExit();
+    leaveFs();
+    syncFsUi();
+    ended.style.display = 'block';
+
+    try { video.pause(); } catch (e) { /* ignorar */ }
+    /* Corta la peticion multipart, que si no sigue abierta para siempre. */
+    try { img.removeAttribute('src'); } catch (e) { /* ignorar */ }
+  }
+
+  retryBtn.onclick = function () { window.location.reload(); };
+
+  /* --------------------------------------------------- Perfil B: MJPEG */
+
+  function startMjpeg() {
+    video.style.display = 'none';
+    img.style.display = 'block';
+    setHud('MJPEG');
+
+    img.onerror = function () {
+      if (connectionLost) { return; }
+      setHud('MJPEG (reconectando)');
+      setTimeout(reloadMjpeg, 1000);
+    };
+    reloadMjpeg();
+  }
+
+  function reloadMjpeg() {
+    if (connectionLost) { return; }
+    /* El parametro de tiempo evita que un proxy o el propio WebView
+       reutilicen una respuesta multipart ya terminada. */
+    img.src = '/mjpeg?t=' + (new Date()).getTime();
+  }
+
+  /* ---------------------------------------------- Perfil A: fMP4 + MSE */
+
+  function startMse() {
+    video.style.display = 'block';
+    setHud('fMP4/MSE conectando');
+
+    xhrJson('/v/live.json', function (status, info) {
+      if (status !== 200 || !info) {
+        setHud('sin servidor, reintentando');
+        setTimeout(startMse, 700);
+        return;
+      }
+      if (!info.ready) {
+        setHud('esperando codificador');
+        setTimeout(startMse, 400);
+        return;
+      }
+
+      var codec = info.codec || 'avc1.42E01F';
+      var mime  = 'video/mp4; codecs="' + codec + '"';
+
+      if (!hasMse || !window.MediaSource.isTypeSupported(mime)) {
+        /* El navegador dijo que tenia MSE pero no acepta lo que produce
+           el telefono. Degradamos en vez de mostrar una pantalla negra. */
+        setHud('codec no soportado, pasando a MJPEG');
+        useMjpeg = true;
+        startMjpeg();
+        return;
+      }
+
+      if (wantAudio) {
+        xhrJson('/a/live.json', function (aStatus, aInfo) {
+          openMediaSource(mime, info,
+            (aStatus === 200 && aInfo && aInfo.ready) ? aInfo : null);
+        });
+      } else {
+        openMediaSource(mime, info, null);
+      }
+    });
+  }
+
+  var mediaSourceOpened = false;
+
+  function openMediaSource(videoMime, videoInfo, audioInfo) {
+    var ms = new window.MediaSource();
+    video.src = window.URL.createObjectURL(ms);
+
+    ms.addEventListener('sourceopen', function () {
+      if (mediaSourceOpened) { return; }
+      mediaSourceOpened = true;
+
+      var videoBuffer = ms.addSourceBuffer(videoMime);
+      /* 'segments', no 'sequence': los tiempos absolutos del tfdt son lo
+         que mantiene audio y video alineados cuando un cliente entra a
+         mitad de la emision. */
+      videoBuffer.mode = 'segments';
+      runTrack(videoBuffer, '/v/', videoInfo.latest);
+      setHud('fMP4 ' + (videoInfo.codec || ''));
+
+      if (audioInfo) {
+        var audioMime = 'audio/mp4; codecs="' + (audioInfo.codec || 'mp4a.40.2') + '"';
+        if (window.MediaSource.isTypeSupported(audioMime)) {
+          var audioBuffer = ms.addSourceBuffer(audioMime);
+          audioBuffer.mode = 'segments';
+          runTrack(audioBuffer, '/a/', audioInfo.latest);
+          video.muted = false;
+        }
+      }
+
+      tryPlay();
+    });
+
+    ms.addEventListener('sourceclose', function () { mediaSourceOpened = false; });
+  }
+
+  function runTrack(sourceBuffer, base, startSequence) {
+    var queue = [];
+    var next  = startSequence;
+
+    sourceBuffer.addEventListener('updateend', pump);
+
+    function pump() {
+      if (sourceBuffer.updating || queue.length === 0) { return; }
+      var chunk = queue.shift();
+      try {
+        sourceBuffer.appendBuffer(chunk);
+      } catch (e) {
+        if (e && e.name === 'QuotaExceededError') {
+          queue.unshift(chunk);
+          evict();
+        }
+      }
+    }
+
+    function evict() {
+      /* El buffer de un WebView de coche es pequeno. Soltamos todo lo
+         que quedo detras del punto de reproduccion. */
+      try {
+        if (!sourceBuffer.updating && video.currentTime > 12) {
+          sourceBuffer.remove(0, video.currentTime - 10);
+        }
+      } catch (e) { /* la siguiente ronda lo reintenta */ }
+    }
+
+    xhrBin(base + 'init.mp4', function (status, buffer) {
+      if (status !== 200 || !buffer) {
+        setTimeout(function () { runTrack(sourceBuffer, base, startSequence); }, 500);
+        return;
+      }
+      queue.push(buffer);
+      pump();
+      loop();
+    });
+
+    function loop() {
+      xhrBin(base + 'seg/' + next + '.m4s', function (status, buffer) {
+        if (status === 200 && buffer) {
+          queue.push(buffer);
+          pump();
+          next = next + 1;
+          loop();
+          return;
+        }
+        /* 410: el segmento ya se descarto porque nos quedamos atras. No
+           sirve de nada seguir persiguiendo una ventana que se aleja mas
+           rapido de lo que descargamos; saltamos al borde en vivo. */
+        if (status === 410) { resync(); return; }
+        /* 404: el long-poll del servidor expiro sin que existiera aun.
+           Reintentar de inmediato no es un bucle ocupado: la peticion
+           anterior estuvo parada varios segundos. */
+        if (status === 404) { loop(); return; }
+        setTimeout(loop, 500);
+      });
+    }
+
+    function resync() {
+      xhrJson(base + 'live.json', function (status, info) {
+        if (status === 200 && info && info.latest >= 0) {
+          next = info.latest;
+          loop();
+        } else {
+          setTimeout(resync, 500);
+        }
+      });
+    }
+  }
+
+  /* Vigilante del borde en vivo: si el buffer se acumula, saltamos hacia
+     delante. En directo, llegar tarde es peor que perder unos fotogramas. */
+  setInterval(function () {
+    if (useMjpeg) { return; }
+    try {
+      if (video.buffered.length === 0) { return; }
+      var end = video.buffered.end(video.buffered.length - 1);
+      var start = video.buffered.start(0);
+
+      if (video.currentTime < start) { video.currentTime = start; }
+      else if (end - video.currentTime > 4) { video.currentTime = end - 0.5; }
+
+      if (video.paused) { tryPlay(); }
+      setHud('fMP4 · buffer ' + (end - video.currentTime).toFixed(1) + 's');
+    } catch (e) { /* aun sin datos */ }
+  }, 2000);
+
+  function tryPlay() {
+    try {
+      var p = video.play();
+      if (p && p['catch']) { p['catch'](function () { /* hace falta otro gesto */ }); }
+    } catch (e) { /* ignorar */ }
+  }
+
+  /* ------------------------------------------------------------ utiles */
+
+  function xhrBin(url, callback) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    try { xhr.responseType = 'arraybuffer'; } catch (e) { /* XHR1 */ }
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) { callback(xhr.status, xhr.response); }
+    };
+    xhr.onerror = function () { callback(0, null); };
+    xhr.send(null);
+  }
+
+  function xhrJson(url, callback) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) { return; }
+      var parsed = null;
+      try { parsed = JSON.parse(xhr.responseText); } catch (e) { parsed = null; }
+      callback(xhr.status, parsed);
+    };
+    xhr.onerror = function () { callback(0, null); };
+    xhr.send(null);
+  }
+
+  function parseQuery() {
+    var out = {};
+    var q = window.location.search;
+    if (!q || q.length < 2) { return out; }
+    var parts = q.substring(1).split('&');
+    for (var i = 0; i < parts.length; i++) {
+      var pair = parts[i].split('=');
+      out[decodeURIComponent(pair[0])] =
+        pair.length > 1 ? decodeURIComponent(pair[1]) : '';
+    }
+    return out;
+  }
+
+  function setStatus(text) { statusEl.innerHTML = ''; statusEl.appendChild(document.createTextNode(text)); }
+  function setHud(text) { hud.innerHTML = ''; hud.appendChild(document.createTextNode(text)); }
+
+})();
+</script>
+
+</body>
+</html>

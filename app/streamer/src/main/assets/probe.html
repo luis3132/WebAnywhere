@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diagnostico del navegador</title>
+<style>
+  body { margin:0; padding:16px; background:#101014; color:#e8e8ec;
+         font-family: Arial, Helvetica, sans-serif; font-size:15px; }
+  h1 { font-size:20px; color:#7ce7c7; margin:0 0 12px 0; }
+  table { border-collapse:collapse; width:100%; margin-bottom:16px; }
+  td { padding:6px 4px; border-bottom:1px solid #2a2a33; vertical-align:top;
+       word-break:break-all; }
+  td.k { color:#9a9aa6; width:42%; }
+  .ok { color:#7ce7c7; font-weight:bold; }
+  .no { color:#ff8a80; font-weight:bold; }
+  .note { color:#9a9aa6; font-size:13px; }
+  a { color:#7ce7c7; }
+</style>
+</head>
+<body>
+
+<h1>Diagnostico del navegador</h1>
+<p class="note" id="sent">Enviando resultados al telefono...</p>
+<table id="out"></table>
+<p><a href="/">&larr; Ir al reproductor</a></p>
+
+<script>
+/* ES5 a proposito: sin const/let, sin arrow functions, sin fetch, sin Promise.
+   Esta pagina tiene que ejecutarse en el WebView mas viejo que exista. */
+(function () {
+  var rows = [];
+  var table = document.getElementById('out');
+
+  function add(key, value, good) {
+    rows.push([key, value, good]);
+    var tr = document.createElement('tr');
+    var tdk = document.createElement('td');
+    tdk.className = 'k';
+    tdk.appendChild(document.createTextNode(key));
+    var tdv = document.createElement('td');
+    if (good === true) { tdv.className = 'ok'; }
+    if (good === false) { tdv.className = 'no'; }
+    tdv.appendChild(document.createTextNode(value));
+    tr.appendChild(tdk);
+    tr.appendChild(tdv);
+    table.appendChild(tr);
+  }
+
+  var hasMse = !!window.MediaSource;
+  var hasWs = !!window.WebSocket;
+  var hasXhr2 = false;
+  try {
+    var probe = new XMLHttpRequest();
+    probe.responseType = 'arraybuffer';
+    hasXhr2 = probe.responseType === 'arraybuffer';
+  } catch (e) { hasXhr2 = false; }
+
+  /* Los dos ultimos bytes son el nivel, y el nivel es lo que decide si el
+     decodificador acepta 720p60 o 1080p60. Sin esta respuesta no hay forma de
+     saber si subir la calidad mejora la imagen o simplemente deja de verse. */
+  var candidates = [
+    'video/mp4; codecs="avc1.42E01E"',  /* Baseline 3.0  - 480p30  */
+    'video/mp4; codecs="avc1.42E01F"',  /* Baseline 3.1  - 720p30  */
+    'video/mp4; codecs="avc1.42E020"',  /* Baseline 3.2  - 720p60  */
+    'video/mp4; codecs="avc1.42E028"',  /* Baseline 4.0  - 1080p30 */
+    'video/mp4; codecs="avc1.42E02A"',  /* Baseline 4.2  - 1080p60 */
+    'video/mp4; codecs="avc1.4D401F"',  /* Main 3.1                */
+    'video/mp4; codecs="avc1.64001F"',  /* High 3.1                */
+    'audio/mp4; codecs="mp4a.40.2"',
+    'video/mp4; codecs="avc1.42E01F, mp4a.40.2"'
+  ];
+
+  var supported = [];
+  if (hasMse && window.MediaSource.isTypeSupported) {
+    for (var i = 0; i < candidates.length; i++) {
+      try {
+        if (window.MediaSource.isTypeSupported(candidates[i])) {
+          supported.push(candidates[i]);
+        }
+      } catch (e2) { /* ignorar */ }
+    }
+  }
+
+  var nativeHls = '';
+  try {
+    var v = document.createElement('video');
+    nativeHls = v.canPlayType('application/vnd.apple.mpegurl') || '';
+  } catch (e3) { nativeHls = ''; }
+
+  var screenInfo = '';
+  try {
+    screenInfo = screen.width + 'x' + screen.height +
+      ' @' + (window.devicePixelRatio || 1);
+  } catch (e4) { screenInfo = 'desconocido'; }
+
+  add('User agent', navigator.userAgent);
+  add('MediaSource (MSE)', hasMse ? 'si' : 'no', hasMse);
+  add('XHR2 arraybuffer', hasXhr2 ? 'si' : 'no', hasXhr2);
+  add('WebSocket', hasWs ? 'si' : 'no', hasWs);
+  add('HLS nativo', nativeHls === '' ? 'no' : nativeHls, nativeHls !== '');
+  add('Pantalla', screenInfo);
+  add('Codecs aceptados', supported.length ? supported.join('\n') : 'ninguno',
+      supported.length > 0);
+
+  add('Perfil recomendado',
+      (hasMse && supported.length) ? 'A: fMP4 + MSE' : 'B: MJPEG',
+      hasMse && supported.length > 0);
+
+  /* Reporte al telefono, form-encoded para que el servidor no necesite
+     un parser de JSON y el cliente no necesite JSON.stringify. */
+  function enc(s) { return encodeURIComponent(s == null ? '' : String(s)); }
+
+  var body =
+    'ua=' + enc(navigator.userAgent) +
+    '&mse=' + (hasMse ? '1' : '0') +
+    '&ws=' + (hasWs ? '1' : '0') +
+    '&hls=' + enc(nativeHls) +
+    '&codecs=' + enc(supported.join(',')) +
+    '&screen=' + enc(screenInfo);
+
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/report', true);
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) {
+        document.getElementById('sent').innerHTML =
+          xhr.status === 200
+            ? 'Resultados enviados. Revisalos en la app del telefono.'
+            : 'No se pudo enviar el reporte (HTTP ' + xhr.status + ').';
+      }
+    };
+    xhr.send(body);
+  } catch (e5) {
+    document.getElementById('sent').innerHTML = 'No se pudo enviar el reporte.';
+  }
+})();
+</script>
+
+</body>
+</html>

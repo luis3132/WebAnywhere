@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Streamer" parent="android:Theme.Material.NoActionBar">
+        <!-- Bar colours are set from MainActivity via enableEdgeToEdge: the
+             XML attributes are ignored from API 35 onwards. -->
+        <item name="android:windowBackground">#FF101014</item>
+    </style>
+</resources>

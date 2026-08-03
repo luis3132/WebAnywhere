@@ -1,0 +1,18 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Screen -->
+    <path
+        android:fillColor="#7CE7C7"
+        android:pathData="M30,36 h48 a4,4 0 0 1 4,4 v28 a4,4 0 0 1 -4,4 h-48 a4,4 0 0 1 -4,-4 v-28 a4,4 0 0 1 4,-4 z" />
+    <!-- Play triangle knocked out of the screen -->
+    <path
+        android:fillColor="#101014"
+        android:pathData="M48,45 L64,54 L48,63 z" />
+    <!-- Broadcast arcs -->
+    <path
+        android:fillColor="#7CE7C7"
+        android:pathData="M44,78 h20 v4 h-20 z" />
+</vector>
