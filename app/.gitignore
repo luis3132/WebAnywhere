@@ -9,3 +9,9 @@ captures/
 .cxx/
 *.apk
 *.aab
+
+# Firma. Perder esto significa no poder volver a actualizar la app instalada:
+# haz copia de seguridad del .jks fuera del repo.
+keystore.properties
+*.jks
+*.keystore
