@@ -24,10 +24,46 @@ enum class Quality(val label: String, val maxWidth: Int, val maxHeight: Int) {
  * could change from inside the car.
  */
 enum class Latency(val label: String, val segmentMs: Int) {
+    /** Measured to stutter on a real head unit. Kept for fast local browsers. */
     INSTANT("100 ms", 100),
     BALANCED("250 ms", 250),
     /** For WebViews that cannot keep up with the request rate. */
     RELAXED("500 ms", 500),
+}
+
+/**
+ * How much media the player keeps ahead of the play head.
+ *
+ * This is the knob that decides smooth-versus-immediate, and it is a genuine
+ * trade rather than a tuning detail: the buffer *is* the delay. Two seconds of
+ * buffer means what you see is two seconds old.
+ *
+ * It buys the one thing segment length cannot. A short segment reduces how long
+ * a frame waits to be *sent*; only a buffer absorbs a frame that arrives late.
+ * A car WebView decoding 1080p on a weak chip misses its deadline often enough
+ * that with no cushion the picture judders — which is worse to watch than a
+ * delay you stop noticing after a few seconds.
+ *
+ * The player holds this by speeding up or slowing down very slightly, never by
+ * jumping: see the drift control in `player.html`.
+ */
+enum class Buffer(val label: String, val ms: Int) {
+    /**
+     * The short end. These only mean what they say when the segments are short
+     * enough to fit inside them — see [StreamConfig.effectiveBufferMs], which
+     * raises anything that asks for less media than the player needs to keep
+     * going.
+     */
+    MS150("150 ms", 150),
+    MS300("300 ms", 300),
+    MS650("650 ms", 650),
+
+    /** Close to live. Needs a browser that comfortably keeps up. */
+    TIGHT("1 s", 1_000),
+    SMOOTH("2 s", 2_000),
+    SAFE("3 s", 3_000),
+    /** For a head unit that stutters at everything else. */
+    MAX("5 s", 5_000),
 }
 
 /**
@@ -78,7 +114,16 @@ data class StreamConfig(
      */
     val keyFrameIntervalMs: Int = 500,
 
-    val latency: Latency = Latency.INSTANT,
+    /**
+     * 250 ms rather than the 100 ms the pipeline can technically do: on a real
+     * head unit, 100 ms segments made the picture judder. Twenty requests a
+     * second is a lot of work for an old WebView, and a stuttering picture at
+     * 100 ms is worse than a smooth one at 250 ms. The shorter setting is still
+     * offered for browsers that can take it.
+     */
+    val latency: Latency = Latency.BALANCED,
+
+    val buffer: Buffer = Buffer.SMOOTH,
 
     // --- MJPEG profile ---
     /** Deliberately smaller: JPEG has no inter-frame compression to lean on. */
@@ -98,4 +143,56 @@ data class StreamConfig(
 
     /** Microsecond target used by the segmenter. */
     val segmentTargetUs: Long get() = latency.segmentMs * 1_000L
+
+    /**
+     * The smallest buffer that is not a promise to drop media.
+     *
+     * A player cannot hold less than the segment it is currently playing, so a
+     * buffer below one segment is not a small cushion — it is a gap. Asking for
+     * 50 ms with 100 ms segments means 50 ms of picture and sound that nothing
+     * ever holds, and they are simply lost.
+     *
+     * One and a half segments is the floor: a whole segment to play from, plus
+     * half of one as slack, so the next has time to arrive before the current
+     * one runs out.
+     */
+    val minBufferMs: Int get() = latency.segmentMs * 3 / 2
+
+    /**
+     * What the player is actually told to hold. Raised above the requested
+     * [buffer] whenever the chosen latency makes that request impossible.
+     */
+    val effectiveBufferMs: Int get() = maxOf(buffer.ms, minBufferMs)
+
+    /** True when [latency] is forcing a bigger buffer than was asked for. */
+    val bufferRaised: Boolean get() = effectiveBufferMs > buffer.ms
+
+    val bufferUs: Long get() = effectiveBufferMs * 1_000L
+
+    /**
+     * How many segments the server must retain for a joining client to be able
+     * to fill [buffer] immediately.
+     *
+     * Twice the buffer, plus a few: a client is served from somewhere inside
+     * this window, not at its edge, so retaining exactly one buffer's worth
+     * would mean the oldest segment expires the moment it is needed.
+     */
+    val retainedSegments: Int
+        get() = (effectiveBufferMs / latency.segmentMs) * 2 + 4
+
+    /**
+     * Changes the latency, carrying the buffer along if it no longer fits.
+     *
+     * Longer segments raise the floor, which can strand the current buffer
+     * below it. Leaving it there would show a selected option that is no longer
+     * selectable, so the choice moves up to the smallest one that still works.
+     */
+    fun withLatency(latency: Latency): StreamConfig {
+        val moved = copy(latency = latency)
+        if (!moved.bufferRaised) return moved
+
+        val smallestValid = Buffer.entries.firstOrNull { it.ms >= moved.minBufferMs }
+            ?: Buffer.entries.last()
+        return moved.copy(buffer = smallestValid)
+    }
 }

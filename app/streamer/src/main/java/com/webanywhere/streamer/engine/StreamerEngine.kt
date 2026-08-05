@@ -1,12 +1,14 @@
 package com.webanywhere.streamer.engine
 
 import android.content.Context
+import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.media.projection.MediaProjection
 import android.util.Log
+import android.view.Display
 import android.view.WindowManager
 import com.webanywhere.streamer.Profile
 import com.webanywhere.streamer.StreamConfig
@@ -90,9 +92,88 @@ class StreamerEngine(
      */
     private val callbackThread = HandlerThread("projection-callback").apply { start() }
 
+    // ------------------------------------------------------------- rotation
+
+    /**
+     * Whether the screen was landscape when the current pipelines were built.
+     *
+     * A `VirtualDisplay` is created at a fixed size and keeps it for life. When
+     * the phone rotates, the compositor reconfigures the source underneath an
+     * encoder that is still expecting the old geometry, and the stream simply
+     * stops — no error, no callback, just no more frames. Nothing detects this
+     * on its own, so rotation has to be watched for explicitly.
+     */
+    private var capturedScreen: Pair<Int, Int>? = null
+    private var rotationJob: Job? = null
+
+    private val displayManager = context.getSystemService(DisplayManager::class.java)
+
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId == Display.DEFAULT_DISPLAY) scheduleRotationCheck()
+        }
+    }
+
     init {
         // Required before createVirtualDisplay on recent Android versions.
         projection.registerCallback(projectionCallback, Handler(callbackThread.looper))
+        displayManager?.registerDisplayListener(displayListener, Handler(callbackThread.looper))
+    }
+
+    /**
+     * Rotating fires several display changes in a row, and the window metrics
+     * do not settle until the animation ends. Rebuilding on the first one would
+     * capture the intermediate geometry and then need doing again.
+     */
+    private fun scheduleRotationCheck() {
+        synchronized(lock) {
+            if (shuttingDown) return
+            rotationJob?.cancel()
+            rotationJob = scope.launch {
+                delay(ROTATION_SETTLE_MS)
+                applyRotation()
+            }
+        }
+    }
+
+    private fun applyRotation() {
+        var rebuilt = false
+        synchronized(lock) {
+            if (shuttingDown) return
+            val size = screenSize()
+            if (size.first <= 0 || size.second <= 0) return
+
+            val previous = capturedScreen ?: return
+            // Comparing the size rather than just portrait-versus-landscape:
+            // this also catches a resolution change, and it is the number the
+            // encoder was actually built from.
+            if (size == previous) return
+
+            Log.i(TAG, "screen changed ${previous.first}x${previous.second} -> " +
+                "${size.first}x${size.second}, rebuilding pipelines")
+
+            // Only what is actually running: rotating with no clients attached
+            // should not start an encoder that nobody asked for.
+            if (videoEncoder != null) {
+                stopVideo()
+                startVideo()
+                rebuilt = true
+            }
+            if (mjpegPipeline != null) {
+                stopMjpeg()
+                startMjpeg()
+                rebuilt = true
+            }
+            // If nothing was running there is no pipeline to rebuild, but the
+            // new geometry still has to be recorded or the next rotation would
+            // compare against a size that was never captured.
+            capturedScreen = size
+        }
+        // Outside the lock: this wakes up HTTP handlers, and they must not
+        // block on a lock the engine is still holding.
+        if (rebuilt) StreamHub.bumpGeneration()
     }
 
     // --------------------------------------------------------------- demand
@@ -154,6 +235,7 @@ class StreamerEngine(
             stopMjpeg()
         }
         capture.releaseAll()
+        runCatching { displayManager?.unregisterDisplayListener(displayListener) }
         runCatching { projection.unregisterCallback(projectionCallback) }
         runCatching { projection.stop() }
         // Safe even when shutdown() is running on this very thread: pending
@@ -184,6 +266,18 @@ class StreamerEngine(
         )
 
         StreamHub.video.clear()
+
+        // Sized from what was actually negotiated, not from a guess: the window
+        // has to hold enough history for a joining client to fill its buffer,
+        // and what that costs in bytes depends entirely on the bitrate. The
+        // headroom factor covers key frames, which are several times the size
+        // of the frames around them.
+        StreamHub.video.resize(
+            segments = config.retainedSegments,
+            maxBytes = (target.bitrate / 8.0 * (config.buffer.ms / 1000.0) * RING_BYTE_HEADROOM)
+                .toInt()
+                .coerceIn(MIN_RING_BYTES, MAX_RING_BYTES),
+        )
 
         val track = Fmp4Track(
             trackId = Fmp4.TRACK_VIDEO,
@@ -313,6 +407,11 @@ class StreamerEngine(
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
 
         StreamHub.audio.clear()
+        StreamHub.audio.resize(
+            segments = config.retainedSegments,
+            maxBytes = (config.audioBitrate / 8 * (config.buffer.ms / 1000) * 3)
+                .coerceAtLeast(256 * 1024),
+        )
 
         val track = Fmp4Track(
             trackId = Fmp4.TRACK_AUDIO,
@@ -421,6 +520,10 @@ class StreamerEngine(
         val (screenW, screenH) = screenSize()
         if (screenW <= 0 || screenH <= 0) return maxWidth to maxHeight
 
+        // Recorded here rather than at the call sites because this is the one
+        // place that reads the real screen, and it runs for both pipelines.
+        capturedScreen = screenW to screenH
+
         val scale = minOf(
             maxWidth.toFloat() / screenW,
             maxHeight.toFloat() / screenH,
@@ -431,7 +534,26 @@ class StreamerEngine(
         return even(screenW * scale) to even(screenH * scale)
     }
 
+    /**
+     * Asks the display itself, not this context's `Configuration`.
+     *
+     * That distinction is the whole bug: a `Service`'s resources are not
+     * reliably updated when the screen rotates, so reading `displayMetrics`
+     * here kept returning the portrait size forever. Nothing looked broken —
+     * the comparison simply always said "unchanged" and the rebuild never ran.
+     * `getRealMetrics` reads the live display state instead.
+     */
     private fun screenSize(): Pair<Int, Int> {
+        val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+        if (display != null) {
+            val metrics = android.util.DisplayMetrics()
+            @Suppress("DEPRECATION")
+            display.getRealMetrics(metrics)
+            if (metrics.widthPixels > 0 && metrics.heightPixels > 0) {
+                return metrics.widthPixels to metrics.heightPixels
+            }
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val wm = context.getSystemService(WindowManager::class.java)
             val bounds = wm?.maximumWindowMetrics?.bounds
@@ -455,5 +577,12 @@ class StreamerEngine(
         const val IDLE_GRACE_MS = 15_000L
 
         const val FPS_WINDOW_MS = 1_000L
+
+        /** Long enough for the rotation animation and the metrics to settle. */
+        const val ROTATION_SETTLE_MS = 600L
+
+        const val RING_BYTE_HEADROOM = 2.5
+        const val MIN_RING_BYTES = 2 * 1024 * 1024
+        const val MAX_RING_BYTES = 48 * 1024 * 1024
     }
 }

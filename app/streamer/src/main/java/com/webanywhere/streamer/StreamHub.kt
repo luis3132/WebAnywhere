@@ -32,6 +32,8 @@ object StreamHub {
 
         val ready: Boolean get() = initSegment != null
 
+        fun resize(segments: Int, maxBytes: Int) = ring.resize(segments, maxBytes)
+
         fun clear() {
             initSegment = null
             codec = null
@@ -40,22 +42,23 @@ object StreamHub {
     }
 
     /**
-     * ~100 ms per segment, so roughly a one second window — and that window
-     * *is* the deadline.
+     * The retained window, which is also the deadline.
      *
-     * Nothing older than about a second can even be asked for: it has been
-     * evicted, and the request gets a 410 that sends the client to the live
-     * edge. That is the intended behaviour rather than a limitation. This is
-     * live video: a frame the client did not render in time is not owed to it,
-     * and delivering it late only pushes every later frame later too.
+     * Anything evicted cannot be asked for: the request gets a 410 that sends
+     * the client to the live edge. That is intended rather than a limitation —
+     * this is live video, and delivering a frame late only pushes every later
+     * frame later too.
      *
-     * The byte cap is the bound that actually matters, because at an uncapped
-     * bitrate a segment can be ten times its usual size. Counting segments
-     * alone would silently turn into tens of megabytes.
+     * These are only starting values. The real bounds are set by the engine
+     * once the buffer setting and the negotiated bitrate are known, because
+     * those are what decide how much history a joining client needs and what it
+     * costs in bytes. The byte cap is the bound that actually matters: at an
+     * uncapped bitrate a segment can be ten times its usual size, and counting
+     * segments alone would quietly turn into tens of megabytes.
      */
-    val video = Track(retainedSegments = 12, maxBytes = 4 * 1024 * 1024)
+    val video = Track(retainedSegments = 24, maxBytes = 8 * 1024 * 1024)
 
-    val audio = Track(retainedSegments = 12, maxBytes = 512 * 1024)
+    val audio = Track(retainedSegments = 24, maxBytes = 1024 * 1024)
 
     val mjpeg = MjpegHub()
 
@@ -70,6 +73,21 @@ object StreamHub {
 
     @Volatile
     var engine: StreamerEngine? = null
+
+    /**
+     * Bumped whenever the video changes shape — today that means the phone was
+     * rotated, which forces a new encoder at a new resolution.
+     *
+     * A running MSE session cannot absorb that: its initialisation segment
+     * describes the old dimensions, and the sequence numbering restarts. The
+     * client polls this and rebuilds when it moves. Making the client ask,
+     * rather than pushing at it, keeps the whole mechanism inside the one HTTP
+     * request it was already making.
+     */
+    private val _generation = MutableStateFlow(0)
+    val generation: StateFlow<Int> = _generation
+
+    fun bumpGeneration() = _generation.update { it + 1 }
 
     // ------------------------------------------------------------ live stats
 

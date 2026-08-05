@@ -46,6 +46,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import com.webanywhere.streamer.Buffer
 import com.webanywhere.streamer.ImageQuality
 import com.webanywhere.streamer.Latency
 import com.webanywhere.streamer.Quality
@@ -297,6 +300,7 @@ private fun LinkCard() {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun QualityCard(enabled: Boolean) {
     val config by StreamHub.configFlow.collectAsStateWithLifecycle()
@@ -335,15 +339,55 @@ private fun QualityCard(enabled: Boolean) {
                     label = latency.label,
                     selected = config.latency == latency,
                     enabled = enabled,
-                ) { StreamHub.config = config.copy(latency = latency) }
+                ) { StreamHub.config = config.withLatency(latency) }
             }
         }
-        if (enabled && config.latency == Latency.INSTANT) {
+        Spacer(Modifier.height(4.dp))
+        Text("Buffer del reproductor", fontSize = 12.sp, color = Color(0xFF9A9AA6))
+        // Wrapped rather than scrolled sideways: eight options do not fit on a
+        // phone, and anything off the edge of a scrolling row is an option the
+        // user never learns exists.
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Buffer.entries.forEach { buffer ->
+                Choice(
+                    label = buffer.label,
+                    selected = config.buffer == buffer,
+                    // Anything under the floor cannot be held by the player, so
+                    // it is not offered. Disabling rather than hiding: the
+                    // option still exists, it is the current latency that rules
+                    // it out, and that is worth being able to see.
+                    enabled = enabled && buffer.ms >= config.minBufferMs,
+                ) { StreamHub.config = config.copy(buffer = buffer) }
+            }
+        }
+        Text(
+            "Colchón que guarda el navegador. Más buffer es más retraso, pero " +
+                "absorbe los tirones. La reproducción se acelera o frena un poco " +
+                "para mantenerlo.",
+            fontSize = 11.sp,
+            color = Color(0xFF9A9AA6),
+        )
+
+        if (enabled && Buffer.entries.any { it.ms < config.minBufferMs }) {
             Text(
-                "100 ms son ~20 peticiones por segundo. Si el navegador del " +
-                    "vehículo se atraganta, sube a 250 ms.",
+                "Los buffers por debajo de ${config.minBufferMs} ms están " +
+                    "bloqueados: con segmentos de ${config.latency.segmentMs} ms " +
+                    "serían fotogramas que nadie guarda, o sea perdidos. Baja la " +
+                    "latencia para desbloquearlos.",
                 fontSize = 11.sp,
                 color = Color(0xFF9A9AA6),
+            )
+        }
+
+        if (enabled && config.latency == Latency.INSTANT) {
+            Text(
+                "100 ms son ~20 peticiones por segundo: en pantallas de coche " +
+                    "suele verse a tirones. Úsalo solo si el navegador aguanta.",
+                fontSize = 11.sp,
+                color = Color(0xFFFFB74D),
             )
         }
 

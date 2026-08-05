@@ -106,6 +106,7 @@ class StreamServer(
         awaitReady(track)
 
         val ring = track.ring
+        val config = StreamHub.config
         call.respondJson(
             buildString {
                 append('{')
@@ -113,16 +114,32 @@ class StreamServer(
                 append(",\"codec\":").append(track.codec.jsonOrNull())
                 append(",\"latest\":").append(ring.latest.value)
                 append(",\"oldest\":").append(ring.oldest)
-                // Where a fresh client must start. Segments are cut on a
-                // duration target now, so most of them begin mid-GOP and are
-                // not valid entry points.
-                append(",\"joinAt\":").append(
-                    if (ring.latestSync >= 0) ring.latestSync else ring.latest.value,
-                )
+                // Where a fresh client must start: far enough behind the live
+                // edge that its buffer is full on the first frame, and on a key
+                // frame, since segments are cut on a duration target now and
+                // most of them begin mid-GOP.
+                append(",\"joinAt\":").append(joinPoint(ring, config.bufferUs))
+                // How much cushion the player should hold. Sent by the server so
+                // the setting lives in one place — the phone — instead of being
+                // hardcoded in a page nobody can edit from inside a car.
+                // The effective value, not the requested one: a buffer smaller
+                // than a segment cannot be held, and sending it would have the
+                // player chasing a target it can never reach.
+                append(",\"bufferMs\":").append(config.effectiveBufferMs)
+                // Lets the client turn its buffer into a segment count, so it
+                // can tell "deliberately behind" from "falling behind".
+                append(",\"segmentMs\":").append(config.latency.segmentMs)
+                append(",\"generation\":").append(StreamHub.generation.value)
                 append(",\"segments\":").append(ring.size)
                 append('}')
             },
         )
+    }
+
+    private fun joinPoint(ring: SegmentRing, bufferUs: Long): Long {
+        val join = ring.joinPointFor(bufferUs)
+        if (join >= 0) return join
+        return if (ring.latestSync >= 0) ring.latestSync else ring.latest.value
     }
 
     private suspend fun RoutingContext.serveInit(track: StreamHub.Track, profile: Profile?) {
@@ -156,7 +173,10 @@ class StreamServer(
                 // trip. Without this it would have to poll live.json to find
                 // out, and by the time it knew it would be further behind.
                 call.response.header(LIVE_LATEST, track.ring.latest.value.toString())
-                call.response.header(LIVE_JOIN, track.ring.latestSync.toString())
+                call.response.header(
+                    LIVE_JOIN,
+                    joinPoint(track.ring, StreamHub.config.bufferUs).toString(),
+                )
                 call.respondBytes(result.segment.data, MP4)
             }
 
@@ -288,8 +308,23 @@ class StreamServer(
         return buildString {
             append('{')
             append("\"running\":").append(stats.running)
+            // The client watches this to notice a rotation: when it moves, the
+            // encoder was rebuilt at a new resolution and the running MSE
+            // session no longer describes what is being sent.
+            append(",\"generation\":").append(StreamHub.generation.value)
             append(",\"capture\":\"").append(stats.captureWidth).append('x')
             append(stats.captureHeight).append('"')
+            // What the encoder is really producing, so the telemetry panel in
+            // the car can tell "the phone is not generating frames" from "the
+            // frames are not arriving". Those look identical from the client
+            // and need opposite fixes.
+            // Rounded through Int arithmetic rather than String.format: this
+            // JSON must use a dot for decimals, and a Spanish locale would
+            // format it with a comma and produce a parse error in the browser.
+            append(",\"fps\":").append((stats.measuredFps * 10).toInt() / 10.0)
+            append(",\"kbps\":").append(stats.measuredKbps)
+            append(",\"targetFps\":").append(stats.targetFps)
+            append(",\"bitrateKbps\":").append(stats.videoBitrateKbps)
             append(",\"fmp4Clients\":").append(stats.fmp4Clients)
             append(",\"mjpegClients\":").append(stats.mjpegClients)
             append(",\"videoSegments\":").append(stats.videoSegments)

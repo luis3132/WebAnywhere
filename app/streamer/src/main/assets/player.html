@@ -37,6 +37,52 @@
   #exitFs { position:absolute; left:0; right:0; top:14px; z-index:30;
             display:none; text-align:center; }
 
+  /* Panel de telemetria, al estilo de un overlay de juego. Monoespaciada y
+     con las etiquetas y los valores en columnas fijas: lo que se mira aqui
+     es como cambia un numero, y si el ancho baila entre refrescos el ojo
+     tiene que volver a buscarlo cada vez. */
+  #stats { position:absolute; left:10px; top:10px; z-index:26; display:none;
+           background:rgba(8,8,12,0.86); border:1px solid rgba(124,231,199,0.35);
+           border-radius:8px; padding:6px 8px; font-size:10px; line-height:1.4;
+           font-family: "Roboto Mono", "DejaVu Sans Mono", Consolas, monospace;
+           color:#c8c8d2; max-height:88%; overflow:auto; min-width:150px; }
+  #stats .sec { color:#7ce7c7; font-weight:bold; margin:6px 0 2px 0;
+                border-bottom:1px solid rgba(124,231,199,0.22); }
+  #stats .sec:first-child { margin-top:0; }
+  #stats .row { white-space:nowrap; }
+  #stats .k { display:inline-block; width:78px; color:#8a8a96; }
+  #stats .v { color:#e8e8ec; }
+
+  /* Modo tira, para contenido apaisado.
+     ---------------------------------------------------------------
+     Con el video en vertical queda banda negra a los lados y el panel cabe
+     ahi sin tapar nada. Apaisado el video ocupa todo, asi que un bloque en
+     una esquina se come imagen; una tira fina arriba estorba mucho menos.
+
+     Se usa inline-block y no flexbox a proposito: flexbox llego tarde y con
+     prefijos a los WebView que este proyecto tiene que soportar, mientras
+     que inline-block es CSS 2.1 y lo entiende cualquier cosa. */
+  #stats.h { left:0; right:0; top:0; border-radius:0; border-width:0 0 1px 0;
+             max-height:none; overflow:hidden; white-space:nowrap;
+             text-align:center; padding:4px 6px; min-width:0; }
+  #stats.h .sec { display:none; }
+  #stats.h .row { display:inline-block; margin:0 7px; }
+  #stats.h .k { width:auto; margin-right:4px; }
+  /* En la tira solo entra lo que se mira mientras algo va mal. El resto se
+     consulta parando y volviendo a vertical. */
+  #stats.h .row.sec2 { display:none; }
+
+  /* La tira ocupa el borde superior entero, justo donde viven los dos
+     botones de pantalla completa. Se bajan mientras este visible. */
+  #stage.strip #fsBtn { top:36px; }
+  #stage.strip #exitFs { top:36px; }
+  #stats .v.warn { color:#ffb74d; }
+  #stats .v.bad  { color:#ff8a80; }
+  #stats .v.good { color:#7ce7c7; }
+
+  #statsBtn { position:absolute; right:14px; bottom:14px; z-index:25;
+              display:none; font-size:13px; padding:8px 12px; }
+
   #ended { position:absolute; top:0; left:0; right:0; bottom:0; z-index:40;
            background:#101014; text-align:center; display:none; }
   #endedInner { position:absolute; top:50%; left:0; right:0; margin-top:-120px; }
@@ -55,6 +101,8 @@
   <video id="v" playsinline webkit-playsinline muted></video>
   <img id="m" alt="">
   <div id="hud"></div>
+  <div id="stats"></div>
+  <button id="statsBtn" class="btn" type="button">Estadisticas</button>
   <button id="fsBtn" class="btn" type="button">Pantalla completa</button>
   <div id="exitFs"><button id="exitFsBtn" class="btn" type="button">Salir de pantalla completa</button></div>
 </div>
@@ -102,6 +150,8 @@
   var fsBtn   = document.getElementById('fsBtn');
   var exitWrap= document.getElementById('exitFs');
   var exitBtn = document.getElementById('exitFsBtn');
+  var statsEl = document.getElementById('stats');
+  var statsBtn= document.getElementById('statsBtn');
   var ended   = document.getElementById('ended');
   var endedText = document.getElementById('endedText');
   var retryBtn= document.getElementById('retryBtn');
@@ -109,10 +159,42 @@
   var playing = false;
   var connectionLost = false;
 
+  /* Contadores de telemetria. Acumuladores desde el arranque: el panel
+     calcula las tasas restando la lectura anterior, que es mas barato y mas
+     robusto que mantener ventanas deslizantes por cada metrica. */
+  var tel = {
+    segments: 0, bytes: 0,      /* segmentos y bytes recibidos */
+    fetchMs: 0, fetches: 0,     /* tiempo total de peticion, para la media */
+    gone: 0, misses: 0, errors: 0,
+    resyncs: 0, seeks: 0, stalls: 0, restarts: 0,
+    startedAt: (new Date()).getTime()
+  };
+
+  function nowMs() { return (new Date()).getTime(); }
+
+  var HEARTBEAT_MS = 2000;
+  /* Por encima del long-poll de 10 s del servidor, no por debajo. */
+  var SEGMENT_TIMEOUT_MS = 14000;
+  var JSON_TIMEOUT_MS = 6000;
+  /* Suelo entre reintentos cuando el servidor contesta al instante. */
+  var MIN_POLL_MS = 250;
+  /* Cuanto medio ya reproducido se conserva detras del cabezal. */
+  var KEEP_BEHIND = 3;
+
   var query   = parseQuery();
   var forced  = query.p || '';
   var wantAudio = query.audio !== '0';
   var hudOn   = query.hud === '1';
+  var statsOn = query.stats === '1';
+  /* Un segundo: es un panel para mirar mientras pasa algo, no un informe.
+     Las tasas se calculan contra la lectura anterior, asi que este intervalo
+     tambien decide sobre cuanto tiempo se promedian. */
+  var statsMs = query.statsms ? parseInt(query.statsms, 10) : 1000;
+  if (isNaN(statsMs) || statsMs < 200) { statsMs = 1000; }
+
+  /* Se guarda aparte porque el panel lo muestra y el codec solo se conoce
+     una vez que el servidor contesta. */
+  var currentCodec = '';
 
   var hasMse  = !!window.MediaSource;
   var useMjpeg = (forced === 'mjpeg') || (forced !== 'mse' && !hasMse);
@@ -125,10 +207,22 @@
     overlay.style.display = 'none';
     playing = true;
     if (hudOn) { hud.style.display = 'block'; }
+    statsBtn.style.display = 'block';
+    if (statsOn) { statsEl.style.display = 'block'; }
     syncFsUi();
     startHeartbeat();
+    setInterval(updateStats, statsMs);
     if (useMjpeg) { startMjpeg(); } else { startMse(); }
   };
+
+  /* Una parada real: el reproductor se quedo sin nada que pintar. Es el
+     sintoma que este panel existe para explicar, asi que se cuenta en el
+     unico sitio donde el navegador lo dice de forma fiable. */
+  if (video.addEventListener) {
+    video.addEventListener('waiting', function () {
+      if (playing && !connectionLost) { tel.stalls = tel.stalls + 1; }
+    }, false);
+  }
 
   /* ------------------------------------------------ pantalla completa */
 
@@ -163,7 +257,13 @@
   function leaveFs() {
     var fn = fsExitFn();
     if (!fn) { return; }
-    try { fn.call(document); } catch (e) { /* ya fuera */ }
+    try {
+      /* Devuelve una promesa que rechaza si ya no estabamos en pantalla
+         completa. Sin capturarla ensucia la consola con un error no
+         gestionado, que es justo donde se van a buscar los de verdad. */
+      var p = fn.call(document);
+      if (p && p['catch']) { p['catch'](function () { /* ya fuera */ }); }
+    } catch (e) { /* ya fuera */ }
   }
 
   function syncFsUi() {
@@ -211,24 +311,91 @@
   /* Un latido contra /status. Sirve para los dos perfiles: un multipart
      que se corta no siempre dispara onerror, y un <video> alimentado por
      MSE simplemente se queda congelado sin avisar. */
+  var streamGeneration = -1;
+
+  /* Encadenado, no setInterval.
+     ---------------------------------------------------------------
+     Con setInterval la siguiente peticion sale aunque la anterior siga en
+     vuelo. Mientras todo va bien no se nota, pero en cuanto el telefono
+     deja de responder — que es exactamente cuando esto importa — se
+     acumulan peticiones pendientes sin limite hasta agotar las conexiones
+     que el navegador permite por origen, y entonces se atascan tambien las
+     de video. El sintoma es que todo queda en "pending" a la vez.
+
+     Encadenando, nunca hay mas de una en vuelo: la siguiente se programa
+     cuando la anterior termina, sea 200, error o timeout. */
   function startHeartbeat() {
     var misses = 0;
-    setInterval(function () {
+
+    /* El latido no para nunca, ni siquiera tras mostrar la pantalla de
+       desconexion: es tambien lo que detecta que el telefono volvio. */
+    function beat() {
       xhrJson('/status', function (status, info) {
-        if (status === 200) {
-          misses = 0;
-          /* El telefono volvio: recargar es la forma mas limpia de
-             reengancharse, porque toda la sesion de MSE quedo invalida. */
-          if (connectionLost) { window.location.reload(); return; }
-          if (info && info.running === false) { showEnded('La transmision se detuvo en el telefono.'); }
+        onBeat(status, info);
+        setTimeout(beat, HEARTBEAT_MS);
+      });
+    }
+
+    function onBeat(status, info) {
+      if (status === 200) {
+        misses = 0;
+        /* El telefono volvio: recargar es la forma mas limpia de
+           reengancharse, porque toda la sesion de MSE quedo invalida. */
+        if (connectionLost) { window.location.reload(); return; }
+        if (info && info.running === false) {
+          showEnded('La transmision se detuvo en el telefono.');
           return;
         }
-        misses = misses + 1;
-        /* Dos fallos seguidos, no uno: un XHR perdido en un salto de
-           canal Wi-Fi no es una desconexion. */
-        if (misses >= 2) { showEnded('El telefono dejo de transmitir.'); }
-      });
-    }, 3000);
+        lastServerStatus = info;
+        checkGeneration(info);
+        return;
+      }
+      misses = misses + 1;
+      /* Dos fallos seguidos, no uno: un XHR perdido en un salto de canal
+         Wi-Fi no es una desconexion. */
+      if (misses >= 2) { showEnded('El telefono dejo de transmitir.'); }
+    }
+
+    beat();
+  }
+
+  /* El telefono giro: el codificador se rehizo a otra resolucion, asi que el
+     segmento de inicializacion que tiene este MediaSource describe un video
+     que ya no existe y la numeracion empezo de cero. No hay forma de
+     arreglarlo en caliente; hay que rehacer la sesion.
+
+     Se rehace en vez de recargar la pagina para no perder la pantalla
+     completa, que en un coche recuperar cuesta dos toques. */
+  function checkGeneration(info) {
+    if (useMjpeg || connectionLost || !info) { return; }
+    if (typeof info.generation !== 'number') { return; }
+    if (streamGeneration < 0) { streamGeneration = info.generation; return; }
+    if (info.generation === streamGeneration) { return; }
+
+    streamGeneration = info.generation;
+    tel.restarts = tel.restarts + 1;
+    restartStream();
+  }
+
+  function restartStream() {
+    /* Invalida de golpe todos los bucles en vuelo de la sesion anterior. */
+    sessionToken = sessionToken + 1;
+    mediaSourceOpened = false;
+    /* Pertenecen al MediaSource que se va a tirar; conservarlos haria que
+       la poda tocara buffers ya desconectados. */
+    activeBuffers = [];
+    setRate(1);
+    setHud('pantalla girada, reconfigurando');
+
+    try { video.pause(); } catch (e) { /* ignorar */ }
+    try {
+      video.removeAttribute('src');
+      video.load();
+    } catch (e) { /* ignorar */ }
+
+    /* Un respiro para que el codificador nuevo publique su init antes de
+       pedirlo, y para que el WebView suelte el MediaSource anterior. */
+    setTimeout(startMse, 400);
   }
 
   function showEnded(reason) {
@@ -241,6 +408,8 @@
     hideExit();
     leaveFs();
     syncFsUi();
+    statsBtn.style.display = 'none';
+    statsEl.style.display = 'none';
     ended.style.display = 'block';
 
     try { video.pause(); } catch (e) { /* ignorar */ }
@@ -274,11 +443,19 @@
 
   /* ---------------------------------------------- Perfil A: fMP4 + MSE */
 
+  /* Cada arranque de MSE lleva su propio testigo. Al rotar el telefono hay
+     que rehacer la sesion entera, y los bucles de la sesion anterior siguen
+     vivos dentro de sus XHR: sin esto seguirian metiendo segmentos del
+     encoder viejo en el buffer del nuevo. */
+  var sessionToken = 0;
+
   function startMse() {
+    var token = sessionToken;
     video.style.display = 'block';
     setHud('fMP4/MSE conectando');
 
     xhrJson('/v/live.json', function (status, info) {
+      if (token !== sessionToken) { return; }
       if (status !== 200 || !info) {
         setHud('sin servidor, reintentando');
         setTimeout(startMse, 700);
@@ -290,7 +467,10 @@
         return;
       }
 
+      applyTiming(info);
+
       var codec = info.codec || 'avc1.42E01F';
+      currentCodec = codec;
       var mime  = 'video/mp4; codecs="' + codec + '"';
 
       if (!hasMse || !window.MediaSource.isTypeSupported(mime)) {
@@ -304,22 +484,24 @@
 
       if (wantAudio) {
         xhrJson('/a/live.json', function (aStatus, aInfo) {
-          openMediaSource(mime, info,
+          if (token !== sessionToken) { return; }
+          openMediaSource(token, mime, info,
             (aStatus === 200 && aInfo && aInfo.ready) ? aInfo : null);
         });
       } else {
-        openMediaSource(mime, info, null);
+        openMediaSource(token, mime, info, null);
       }
     });
   }
 
   var mediaSourceOpened = false;
 
-  function openMediaSource(videoMime, videoInfo, audioInfo) {
+  function openMediaSource(token, videoMime, videoInfo, audioInfo) {
     var ms = new window.MediaSource();
     video.src = window.URL.createObjectURL(ms);
 
     ms.addEventListener('sourceopen', function () {
+      if (token !== sessionToken) { return; }
       if (mediaSourceOpened) { return; }
       mediaSourceOpened = true;
 
@@ -328,7 +510,7 @@
          que mantiene audio y video alineados cuando un cliente entra a
          mitad de la emision. */
       videoBuffer.mode = 'segments';
-      runTrack(videoBuffer, '/v/', joinPoint(videoInfo));
+      runTrack(token, videoBuffer, '/v/', joinPoint(videoInfo));
       setHud('fMP4 ' + (videoInfo.codec || ''));
 
       if (audioInfo) {
@@ -336,7 +518,7 @@
         if (window.MediaSource.isTypeSupported(audioMime)) {
           var audioBuffer = ms.addSourceBuffer(audioMime);
           audioBuffer.mode = 'segments';
-          runTrack(audioBuffer, '/a/', joinPoint(audioInfo));
+          runTrack(token, audioBuffer, '/a/', joinPoint(audioInfo));
           video.muted = false;
         }
       }
@@ -347,13 +529,14 @@
     ms.addEventListener('sourceclose', function () { mediaSourceOpened = false; });
   }
 
-  function runTrack(sourceBuffer, base, startSequence) {
+  function runTrack(token, sourceBuffer, base, startSequence) {
     var queue = [];
     var next  = startSequence;
 
     sourceBuffer.addEventListener('updateend', pump);
 
     function pump() {
+      if (token !== sessionToken) { return; }
       if (sourceBuffer.updating || queue.length === 0) { return; }
       var chunk = queue.shift();
       try {
@@ -367,20 +550,22 @@
     }
 
     function evict() {
-      /* El buffer de un WebView de coche es pequeno. Soltamos todo lo
-         que quedo detras del punto de reproduccion. */
-      try {
-        if (!sourceBuffer.updating && video.currentTime > 12) {
-          sourceBuffer.remove(0, video.currentTime - 10);
-        }
-      } catch (e) { /* la siguiente ronda lo reintenta */ }
+      trimBuffer(sourceBuffer);
     }
 
-    sourceBuffer.addEventListener('updateend', trimToLiveEdge);
+    /* Se registra para que la poda periodica lo alcance. Antes solo se
+       liberaba al recibir QuotaExceededError, es decir cuando el buffer ya
+       estaba lleno: lo ya reproducido se acumulaba sin limite hasta que el
+       navegador se quejaba. */
+    activeBuffers.push(sourceBuffer);
 
     xhrBin(base + 'init.mp4', function (status, buffer) {
+      if (token !== sessionToken) { return; }
       if (status !== 200 || !buffer) {
-        setTimeout(function () { runTrack(sourceBuffer, base, startSequence); }, 500);
+        setTimeout(function () {
+          if (token !== sessionToken) { return; }
+          runTrack(token, sourceBuffer, base, startSequence);
+        }, 500);
         return;
       }
       queue.push(buffer);
@@ -389,8 +574,21 @@
     });
 
     function loop() {
+      if (token !== sessionToken) { return; }
+      var sentAt = nowMs();
       xhrBin(base + 'seg/' + next + '.m4s', function (status, buffer, xhr) {
+        if (token !== sessionToken) { return; }
+
         if (status === 200 && buffer) {
+          /* Solo se cronometran los aciertos. Un 404 es el long-poll del
+             servidor esperando a que exista el segmento, y meterlo en la
+             media convertiria este numero en basura. */
+          tel.fetches = tel.fetches + 1;
+          tel.fetchMs = tel.fetchMs + (nowMs() - sentAt);
+          tel.segments = tel.segments + 1;
+          if (typeof buffer.byteLength === 'number') {
+            tel.bytes = tel.bytes + buffer.byteLength;
+          }
           queue.push(buffer);
           pump();
           next = next + 1;
@@ -403,7 +601,7 @@
              ni una peticion extra. */
           var latest = headerNumber(xhr, 'X-Live-Latest');
           var join = headerNumber(xhr, 'X-Live-Join');
-          if (latest >= 0 && (latest - next) > MAX_LAG_SEGMENTS && join > next) {
+          if (latest >= 0 && (latest - next) > maxLagSegments && join > next) {
             next = join;
           }
 
@@ -413,18 +611,33 @@
         /* 410: el segmento ya se descarto porque nos quedamos atras. No
            sirve de nada seguir persiguiendo una ventana que se aleja mas
            rapido de lo que descargamos; saltamos al borde en vivo. */
-        if (status === 410) { resync(); return; }
+        if (status === 410) { tel.gone = tel.gone + 1; resync(); return; }
         /* 404: el long-poll del servidor expiro sin que existiera aun.
            Reintentar de inmediato no es un bucle ocupado: la peticion
            anterior estuvo parada varios segundos. */
-        if (status === 404) { loop(); return; }
+        /* 404: el long-poll del servidor expiro sin que el segmento
+           existiera. Reintentar de inmediato es correcto solo si la
+           peticion de verdad estuvo esperando; si vuelve al instante — el
+           servidor se reinicio, o un proxy contesto por el — reintentar sin
+           pausa seria un bucle ocupado martilleando la red. */
+        if (status === 404) {
+          tel.misses = tel.misses + 1;
+          var waited = nowMs() - sentAt;
+          if (waited < MIN_POLL_MS) { setTimeout(loop, MIN_POLL_MS); } else { loop(); }
+          return;
+        }
+        tel.errors = tel.errors + 1;
         setTimeout(loop, 500);
       });
     }
 
     function resync() {
+      if (token !== sessionToken) { return; }
+      tel.resyncs = tel.resyncs + 1;
       xhrJson(base + 'live.json', function (status, info) {
+        if (token !== sessionToken) { return; }
         if (status === 200 && info && info.latest >= 0) {
+          applyTiming(info);
           next = joinPoint(info);
           loop();
         } else {
@@ -443,40 +656,163 @@
     return info.latest;
   }
 
-  /* Vigilante del borde en vivo. En directo, llegar tarde es peor que
-     perder fotogramas: el retraso no se recupera solo, se acumula. Los
-     margenes son ajustados a proposito — con segmentos de 100 ms, tolerar
-     varios segundos de buffer tiraria por la borda todo lo que se gana
-     acortandolos. */
-  var TARGET_LAG = 0.15;   /* a donde saltamos: segundo y medio de segmento */
-  var MAX_LAG    = 0.35;   /* a partir de aqui, saltamos */
-  var MAX_LAG_SEGMENTS = 3;
+  /* Control de deriva.
+     ---------------------------------------------------------------
+     En directo el retraso no se recupera solo: si no se corrige, crece.
+     Pero la herramienta obvia — mover currentTime — es un seek, y un seek
+     en MSE vacia el pipeline del decodificador y lo obliga a rearrancar
+     desde el fotograma clave anterior. Con keyframes cada 500 ms eso es
+     hasta medio segundo de video que hay que volver a decodificar.
 
-  /* Se llama en cada updateend, no solo cada pocos cientos de ms: el
-     retraso se corrige en cuanto aparece, no en la siguiente ronda. */
-  function trimToLiveEdge() {
+     Un decodificador de coche no aguanta eso mas que muy de vez en cuando,
+     y ademas se realimenta: el seek causa una pausa, la pausa aumenta el
+     retraso, el retraso dispara otro seek.
+
+     Asi que la correccion normal es acelerar la reproduccion un poco. Un
+     1,08x drena el exceso de forma continua, sin tocar el decodificador y
+     sin que se note. El seek queda de ultimo recurso: solo cuando el
+     retraso ya es demasiado grande para drenarlo, y como mucho una vez
+     cada pocos segundos. */
+  /* El objetivo lo manda el servidor (bufferMs), porque el ajuste vive en el
+     telefono: dentro del coche no hay forma de editar esta pagina. */
+  var targetLag = 2.0;
+  var maxLagSegments = 12;
+
+  /* Umbrales derivados del objetivo, no constantes.
+     ---------------------------------------------------------------
+     Con margenes fijos de 400 ms un objetivo de 50 ms no se corregiria
+     nunca: haria falta pasarse de 450 ms — nueve veces el objetivo — para
+     que se moviera algo. Y con 5 s de objetivo unos margenes pensados para
+     50 ms harian que el control estuviera actuando permanentemente.
+
+     Se recalculan en applyTiming. Con el valor por defecto de 2 s dan
+     exactamente los mismos numeros que antes. */
+  var nudgeAt = 2.40;   /* por encima: acelerar */
+  var slowAt  = 1.60;   /* por debajo: frenar antes de quedarse seco */
+  var seekAt  = 4.00;   /* tan lejos que ya no se drena: saltar */
+
+  var FAST_RATE = 1.08;
+  var SLOW_RATE = 0.96;
+  var SEEK_COOLDOWN_MS = 4000;
+
+  var lastSeekAt = 0;
+
+  function applyTiming(info) {
+    if (!info) { return; }
+    var ms = query.buffer ? parseInt(query.buffer, 10) : info.bufferMs;
+    if (typeof ms === 'number' && !isNaN(ms) && ms > 0) {
+      targetLag = ms / 1000;
+
+      /* Proporcionales al objetivo, con topes: por debajo de ~100 ms de
+         banda muerta el control reaccionaria al ruido de medida del propio
+         navegador, y por encima de 400 ms dejaria de corregir a tiempo por
+         mucho buffer que haya. */
+      nudgeAt = targetLag + Math.min(0.40, Math.max(0.10, targetLag * 0.30));
+      slowAt  = targetLag - Math.min(0.40, targetLag * 0.40);
+      seekAt  = targetLag + Math.max(0.50, targetLag);
+    }
+
+    /* Con buffer, ir por detras del borde es lo correcto, no un sintoma. Sin
+       esta cuenta el cliente confundiria su propio colchon con un retraso y
+       saltaria hacia adelante, destruyendo justo lo que acaba de llenar. */
+    var seg = info.segmentMs;
+    if (typeof seg === 'number' && seg > 0) {
+      maxLagSegments = Math.ceil((targetLag * 1000) / seg) + 4;
+    }
+  }
+
+  function setRate(rate) {
+    /* Comparar antes de asignar: reasignar el mismo valor sigue
+       disparando ratechange en algunos WebViews. */
+    try { if (video.playbackRate !== rate) { video.playbackRate = rate; } }
+    catch (e) { /* algunos no lo permiten; entonces solo queda el seek */ }
+  }
+
+  /* Los SourceBuffer vivos de la sesion actual. Se vacia al rehacerla. */
+  var activeBuffers = [];
+
+  /* Suelta lo que ya se reprodujo.
+     ---------------------------------------------------------------
+     MSE no descarta nada por su cuenta: todo lo que se le da con
+     appendBuffer se queda hasta que se pide quitarlo, asi que un directo
+     que corre una hora acumula una hora de video decodificado. En un
+     WebView de coche eso termina en QuotaExceededError o, peor, en que el
+     sistema mata la pestana.
+
+     Solo se toca lo que queda detras del cabezal, y dejando un margen: el
+     medio de delante es justamente el colchon. */
+  function trimBuffer(sourceBuffer) {
+    try {
+      if (sourceBuffer.updating) { return; }
+      if (sourceBuffer.buffered.length === 0) { return; }
+
+      var start = sourceBuffer.buffered.start(0);
+      var cutoff = video.currentTime - KEEP_BEHIND;
+      /* Un margen antes de molestarse: remove() dispara updateend y bloquea
+         el buffer mientras corre, asi que hacerlo por decimas de segundo
+         estorbaria a los appendBuffer sin liberar nada util. */
+      if (cutoff - start < 1) { return; }
+
+      sourceBuffer.remove(start, cutoff);
+    } catch (e) { /* la siguiente ronda lo reintenta */ }
+  }
+
+  function trimAllBuffers() {
+    for (var i = 0; i < activeBuffers.length; i++) {
+      trimBuffer(activeBuffers[i]);
+    }
+  }
+
+  function driftControl() {
     if (useMjpeg || connectionLost) { return; }
     try {
       if (video.buffered.length === 0) { return; }
-      var end = video.buffered.end(video.buffered.length - 1);
+      var end   = video.buffered.end(video.buffered.length - 1);
       var start = video.buffered.start(0);
 
+      /* El buffer se vacio por detras del cabezal: no es deriva, es que no
+         hay nada que reproducir. Aqui el salto es inmediato y sin cuota. */
       if (video.currentTime < start) {
         video.currentTime = start;
-      } else if (end - video.currentTime > MAX_LAG) {
-        video.currentTime = end - TARGET_LAG;
+        setRate(1);
+        return;
       }
+
+      var lag = end - video.currentTime;
+      var now = (new Date()).getTime();
+
+      if (lag > seekAt && (now - lastSeekAt) > SEEK_COOLDOWN_MS) {
+        video.currentTime = end - targetLag;
+        lastSeekAt = now;
+        tel.seeks = tel.seeks + 1;
+        setRate(1);
+      } else if (lag > nudgeAt) {
+        setRate(FAST_RATE);
+      } else if (lag < slowAt) {
+        /* El buffer se esta quedando seco. Frenar un poco deja que el borde
+           en vivo se aleje y lo rellena — mucho mejor que llegar a cero y
+           tener que parar del todo, que es el tiron que se ve. */
+        setRate(SLOW_RATE);
+      } else {
+        setRate(1);
+      }
+      /* La banda muerta alrededor del objetivo es lo que evita alternar
+         entre acelerar y frenar sin parar. */
     } catch (e) { /* aun sin datos */ }
   }
 
   setInterval(function () {
     if (useMjpeg || connectionLost) { return; }
     try {
+      driftControl();
+      trimAllBuffers();
+      if (video.paused) { tryPlay(); }
       if (video.buffered.length === 0) { return; }
       var end = video.buffered.end(video.buffered.length - 1);
-      trimToLiveEdge();
-      if (video.paused) { tryPlay(); }
-      setHud('fMP4 · ' + Math.round((end - video.currentTime) * 1000) + ' ms');
+      var mark = video.playbackRate > 1 ? ' ▲'
+               : (video.playbackRate < 1 ? ' ▼' : '');
+      setHud('fMP4 · ' + Math.round((end - video.currentTime) * 1000) + '/' +
+             Math.round(targetLag * 1000) + ' ms' + mark);
     } catch (e) { /* aun sin datos */ }
   }, 500);
 
@@ -487,16 +823,306 @@
     } catch (e) { /* ignorar */ }
   }
 
+  /* ------------------------------------------------------ telemetria */
+
+  /* Las filas se crean una sola vez y despues solo se toca el texto del
+     valor. Reconstruir el panel entero cada segundo con innerHTML obligaria
+     al WebView a reparsear y recalcular el layout — barato en un portatil,
+     no en el chip de una pantalla de coche, que es justo el equipo donde
+     este panel sirve para algo. */
+  var statValues = {};
+  var lastServerStatus = null;
+
+  function buildStats() {
+    /* El tercer campo marca las filas secundarias: siguen ahi en el panel
+       vertical, pero no caben en la tira apaisada. */
+    var spec = [
+      ['sec', 'Reproduccion'],
+      ['fps', 'FPS'],
+      ['dropped', 'Perdidos'],
+      ['rate', 'Vel'],
+      ['lag', 'Retraso'],
+      ['buffer', 'Buffer'],
+      ['stalls', 'Paradas'],
+      ['sec', 'Video'],
+      ['res', 'Resolucion', 1],
+      ['codec', 'Codec', 1],
+      ['sec', 'Red'],
+      ['segrate', 'Seg/s'],
+      ['kbps', 'Red'],
+      ['rtt', 'Peticion', 1],
+      // Tres filas cortas en vez de una larga: una sola linea con los tres
+      // contadores fijaba ella sola el ancho de todo el panel.
+      ['seeks', 'Saltos', 1],
+      ['resyncs', 'Resync', 1],
+      ['gone', 'Caducados', 1],
+      ['sec', 'Telefono'],
+      ['srvfps', 'Enc'],
+      ['srvkbps', 'Bitrate'],
+      ['capture', 'Captura', 1],
+      ['clients', 'Clientes', 1],
+      ['uptime', 'En marcha', 1]
+    ];
+
+    for (var i = 0; i < spec.length; i++) {
+      var key = spec[i][0];
+      var label = spec[i][1];
+      var secondary = spec[i][2];
+
+      if (key === 'sec') {
+        var head = document.createElement('div');
+        head.className = 'sec';
+        head.appendChild(document.createTextNode(label));
+        statsEl.appendChild(head);
+        continue;
+      }
+
+      var row = document.createElement('div');
+      row.className = secondary ? 'row sec2' : 'row';
+
+      var k = document.createElement('span');
+      k.className = 'k';
+      k.appendChild(document.createTextNode(label));
+
+      var v = document.createElement('span');
+      v.className = 'v';
+      v.appendChild(document.createTextNode('-'));
+
+      row.appendChild(k);
+      row.appendChild(v);
+      statsEl.appendChild(row);
+      statValues[key] = v;
+    }
+  }
+
+  /* level: '', 'good', 'warn' o 'bad'. Colorear es la mitad del valor de un
+     panel asi: un numero suelto no dice si esta bien. */
+  function setStat(key, text, level) {
+    var el = statValues[key];
+    if (!el) { return; }
+    el.firstChild.nodeValue = text;
+    el.className = 'v' + (level ? ' ' + level : '');
+  }
+
+  /* Fotogramas decodificados y perdidos. La API moderna y la vieja de WebKit
+     dicen lo mismo con nombres distintos; sin ninguna de las dos no hay
+     forma de saberlo y se muestra como no disponible. */
+  function frameCounts() {
+    try {
+      if (video.getVideoPlaybackQuality) {
+        var q = video.getVideoPlaybackQuality();
+        return { decoded: q.totalVideoFrames, dropped: q.droppedVideoFrames };
+      }
+      if (typeof video.webkitDecodedFrameCount === 'number') {
+        return {
+          decoded: video.webkitDecodedFrameCount,
+          dropped: video.webkitDroppedFrameCount || 0
+        };
+      }
+    } catch (e) { /* no disponible */ }
+    return null;
+  }
+
+  var prev = null;
+  var statsHorizontal = null;
+
+  /* Se mira el contenido, no la ventana: la pantalla del coche es apaisada
+     casi siempre, pero con el telefono en vertical el video llega vertical y
+     deja banda negra a los lados, que es justo donde el panel no molesta. Lo
+     que decide es la forma de la imagen. */
+  function wantsStrip() {
+    if (video.videoWidth > 0 && video.videoHeight > 0) {
+      return video.videoWidth > video.videoHeight;
+    }
+    /* En MJPEG no hay videoWidth, asi que se cae a la forma de la ventana. */
+    return (window.innerWidth || 0) > (window.innerHeight || 0);
+  }
+
+  function syncStatsLayout() {
+    var strip = wantsStrip();
+    /* Solo se toca className cuando cambia de verdad: reasignarlo cada
+       segundo provoca un recalculo de estilos en todo el panel. */
+    if (strip !== statsHorizontal) {
+      statsHorizontal = strip;
+      statsEl.className = strip ? 'h' : '';
+    }
+    var offset = (statsEl.style.display === 'block' && strip) ? 'strip' : '';
+    if (stage.className !== offset) { stage.className = offset; }
+  }
+
+  function updateStats() {
+    if (statsEl.style.display !== 'block') { return; }
+
+    syncStatsLayout();
+
+    var now = nowMs();
+    var frames = useMjpeg ? null : frameCounts();
+
+    /* Las tasas se miden contra la lectura anterior, no contra el arranque:
+       una media desde el principio esconde exactamente lo que se quiere ver,
+       que es como esta yendo ahora. */
+    var span = prev ? (now - prev.at) / 1000 : 0;
+    var rate = function (current, before) {
+      if (!prev || span <= 0) { return null; }
+      return (current - before) / span;
+    };
+
+    // --- reproduccion
+    if (frames) {
+      var fps = rate(frames.decoded, prev ? prev.decoded : 0);
+      setStat('fps', fps === null ? '...' : fps.toFixed(1),
+              fps === null ? '' : (fps < 20 ? 'bad' : (fps < 45 ? 'warn' : 'good')));
+      setStat('dropped', String(frames.dropped),
+              frames.dropped > 0 ? 'warn' : 'good');
+    } else {
+      /* En MJPEG no hay <video> ni buffer: el perfil es un <img> que el
+         navegador repinta. Nada de esta seccion aplica, y decirlo es mas
+         util que llenarla de guiones. */
+      var why = useMjpeg ? 'n/d (MJPEG)' : 'n/d';
+      setStat('fps', why);
+      setStat('dropped', why);
+    }
+
+    var pr = video.playbackRate || 1;
+    setStat('rate', pr.toFixed(2) + 'x' +
+            (pr > 1 ? ' ▲' : (pr < 1 ? ' ▼' : '')),
+            pr === 1 ? 'good' : 'warn');
+
+    var lag = null;
+    var buffered = 0;
+    try {
+      if (video.buffered.length > 0) {
+        var end = video.buffered.end(video.buffered.length - 1);
+        lag = end - video.currentTime;
+        buffered = end - video.buffered.start(0);
+      }
+    } catch (e) { /* aun sin datos */ }
+
+    if (lag === null) {
+      setStat('lag', '...');
+    } else {
+      var off = Math.abs(lag - targetLag);
+      setStat('lag', Math.round(lag * 1000) + ' / ' +
+              Math.round(targetLag * 1000) + ' ms',
+              off < 0.4 ? 'good' : (off < 1.2 ? 'warn' : 'bad'));
+    }
+    /* Total retenido = lo ya reproducido que aun no se ha podado, mas el
+       colchon. Si este numero crece sin parar, la poda no esta corriendo. */
+    setStat('buffer', buffered.toFixed(1) + ' s',
+            buffered > (targetLag + KEEP_BEHIND + 4) ? 'warn' : 'good');
+    setStat('stalls', String(tel.stalls), tel.stalls > 0 ? 'warn' : 'good');
+
+    // --- video
+    if (useMjpeg) {
+      setStat('res', 'segun el telefono');
+      setStat('codec', 'JPEG (multipart)');
+    } else {
+      setStat('res', video.videoWidth ? (video.videoWidth + 'x' + video.videoHeight) : '...');
+      setStat('codec', currentCodec || '...');
+    }
+
+    // --- red
+    var segs = rate(tel.segments, prev ? prev.segments : 0);
+    setStat('segrate', segs === null ? '...' : segs.toFixed(1));
+
+    var bps = rate(tel.bytes, prev ? prev.bytes : 0);
+    setStat('kbps', bps === null ? '...' : Math.round(bps * 8 / 1000) + ' kbps');
+
+    var fetches = tel.fetches - (prev ? prev.fetches : 0);
+    var ms = tel.fetchMs - (prev ? prev.fetchMs : 0);
+    if (!prev || fetches <= 0) {
+      setStat('rtt', '...');
+    } else {
+      var avg = Math.round(ms / fetches);
+      setStat('rtt', avg + ' ms', avg < 60 ? 'good' : (avg < 200 ? 'warn' : 'bad'));
+    }
+
+    function counter(key, value) {
+      setStat(key, String(value), value === 0 ? 'good' : (value < 5 ? 'warn' : 'bad'));
+    }
+    counter('seeks', tel.seeks);
+    counter('resyncs', tel.resyncs);
+    counter('gone', tel.gone + tel.errors);
+
+    // --- telefono
+    var s = lastServerStatus;
+    if (s) {
+      setStat('srvfps', typeof s.fps === 'number' ? s.fps.toFixed(1) : '-');
+      setStat('srvkbps', typeof s.kbps === 'number' ? s.kbps + ' kbps' : '-');
+      setStat('capture', s.capture || '-');
+      setStat('clients', String((s.fmp4Clients || 0) + (s.mjpegClients || 0)));
+    }
+
+    setStat('uptime', Math.round((now - tel.startedAt) / 1000) + ' s' +
+            (tel.restarts ? ' · ' + tel.restarts + ' reinicios' : ''));
+
+    prev = {
+      at: now,
+      decoded: frames ? frames.decoded : 0,
+      segments: tel.segments,
+      bytes: tel.bytes,
+      fetches: tel.fetches,
+      fetchMs: tel.fetchMs
+    };
+  }
+
+  function toggleStats() {
+    var on = statsEl.style.display !== 'block';
+    statsEl.style.display = on ? 'block' : 'none';
+    if (on) { prev = null; updateStats(); } else { syncStatsLayout(); }
+  }
+
+  statsBtn.onclick = function (ev) {
+    if (ev && ev.stopPropagation) { ev.stopPropagation(); }
+    toggleStats();
+  };
+
+  /* Se construye aqui y no arriba: `var` iza la declaracion pero no el
+     valor, asi que llamar a esto antes de la linea que crea statValues lo
+     encontraria como undefined. */
+  buildStats();
+
   /* ------------------------------------------------------------ utiles */
 
+  /* Un timeout en cada peticion.
+     ---------------------------------------------------------------
+     Todos los bucles de esta pagina son encadenados: la siguiente peticion
+     sale cuando termina la anterior. Eso acota cuantas hay en vuelo, pero
+     solo si terminan. Una peticion colgada — un Wi-Fi que se va sin cerrar
+     la conexion, un TCP que nadie resetea — dejaria su cadena parada para
+     siempre y en silencio.
+
+     Los segmentos usan un margen largo porque el servidor hace long-poll de
+     10 s esperando a que el segmento exista: cortar antes seria cancelar
+     una peticion que estaba funcionando bien. */
+  function armTimeout(xhr, ms, onTimeout) {
+    try {
+      xhr.timeout = ms;
+      xhr.ontimeout = onTimeout;
+    } catch (e) { /* XHR sin soporte de timeout: queda el onerror */ }
+  }
+
   function xhrBin(url, callback) {
+    var done = false;
     var xhr = new XMLHttpRequest();
     xhr.open('GET', url, true);
     try { xhr.responseType = 'arraybuffer'; } catch (e) { /* XHR1 */ }
+
+    /* El guardia contra doble llamada importa: un timeout y un error
+       pueden dispararse los dos, y llamar dos veces al callback arrancaria
+       dos bucles paralelos sobre el mismo track — justo el apilamiento de
+       peticiones que se quiere evitar. */
+    function finish(status, body) {
+      if (done) { return; }
+      done = true;
+      callback(status, body, xhr);
+    }
+
     xhr.onreadystatechange = function () {
-      if (xhr.readyState === 4) { callback(xhr.status, xhr.response, xhr); }
+      if (xhr.readyState === 4) { finish(xhr.status, xhr.response); }
     };
-    xhr.onerror = function () { callback(0, null, null); };
+    xhr.onerror = function () { finish(0, null); };
+    armTimeout(xhr, SEGMENT_TIMEOUT_MS, function () { finish(0, null); });
     xhr.send(null);
   }
 
@@ -510,15 +1136,24 @@
   }
 
   function xhrJson(url, callback) {
+    var done = false;
     var xhr = new XMLHttpRequest();
     xhr.open('GET', url, true);
+
+    function finish(status, body) {
+      if (done) { return; }
+      done = true;
+      callback(status, body);
+    }
+
     xhr.onreadystatechange = function () {
       if (xhr.readyState !== 4) { return; }
       var parsed = null;
       try { parsed = JSON.parse(xhr.responseText); } catch (e) { parsed = null; }
-      callback(xhr.status, parsed);
+      finish(xhr.status, parsed);
     };
-    xhr.onerror = function () { callback(0, null); };
+    xhr.onerror = function () { finish(0, null); };
+    armTimeout(xhr, JSON_TIMEOUT_MS, function () { finish(0, null); });
     xhr.send(null);
   }
 

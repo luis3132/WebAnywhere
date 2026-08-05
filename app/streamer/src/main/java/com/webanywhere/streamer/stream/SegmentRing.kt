@@ -18,7 +18,27 @@ import kotlinx.coroutines.withTimeout
  * the state flow until the encoder produces it. One request, one segment, no
  * spinning.
  */
-class SegmentRing(private val capacity: Int, private val maxBytes: Int = Int.MAX_VALUE) {
+class SegmentRing(capacity: Int, maxBytes: Int = Int.MAX_VALUE) {
+
+    /**
+     * Both bounds are mutable because they depend on settings the user changes
+     * while the app is running: the buffer size decides how much history a
+     * joining client needs, and the negotiated bitrate decides what that costs
+     * in bytes. Neither is known when this object is constructed.
+     */
+    @Volatile
+    private var capacity: Int = capacity
+
+    @Volatile
+    private var maxBytes: Int = maxBytes
+
+    fun resize(capacity: Int, maxBytes: Int) {
+        synchronized(lock) {
+            this.capacity = capacity.coerceAtLeast(2)
+            this.maxBytes = maxBytes
+            trim()
+        }
+    }
 
     class Segment(
         val sequence: Long,
@@ -56,14 +76,7 @@ class SegmentRing(private val capacity: Int, private val maxBytes: Int = Int.MAX
         synchronized(lock) {
             items.addLast(segment)
             bytes += segment.data.size
-
-            // Bounded by count *and* by bytes: at an uncapped bitrate a segment
-            // can be an order of magnitude larger than expected, and a
-            // count-only bound would quietly turn into tens of megabytes.
-            while (items.size > capacity || (bytes > maxBytes && items.size > 2)) {
-                bytes -= items.removeFirst().data.size
-            }
-            oldest = items.first().sequence
+            trim()
 
             if (segment.isSync) latestSync = segment.sequence
             if (latestSync < oldest) {
@@ -71,6 +84,44 @@ class SegmentRing(private val capacity: Int, private val maxBytes: Int = Int.MAX
             }
         }
         _latest.value = segment.sequence
+    }
+
+    /** Caller must hold [lock]. */
+    private fun trim() {
+        if (items.isEmpty()) return
+        // Bounded by count *and* by bytes: at an uncapped bitrate a segment can
+        // be an order of magnitude larger than expected, and a count-only bound
+        // would quietly turn into tens of megabytes.
+        while (items.size > capacity || (bytes > maxBytes && items.size > 2)) {
+            bytes -= items.removeFirst().data.size
+        }
+        oldest = items.first().sequence
+    }
+
+    /**
+     * The newest entry point that still leaves [bufferUs] of media behind it.
+     *
+     * A joining client needs its buffer filled from the start — starting at the
+     * live edge with nothing in hand means the first hiccup is a stall. So it
+     * joins deliberately behind, far enough back that the cushion exists on
+     * frame one.
+     *
+     * Only key-frame segments qualify, and if the window does not hold enough
+     * media yet this returns the deepest one available: less cushion than asked
+     * for beats no picture.
+     */
+    fun joinPointFor(bufferUs: Long): Long = synchronized(lock) {
+        var after = 0L
+        var deepestSync = -1L
+        for (i in items.indices.reversed()) {
+            val segment = items[i]
+            if (segment.isSync) {
+                deepestSync = segment.sequence
+                if (after >= bufferUs) return segment.sequence
+            }
+            after += segment.durationUs
+        }
+        deepestSync
     }
 
     fun get(sequence: Long): Segment? = synchronized(lock) {
