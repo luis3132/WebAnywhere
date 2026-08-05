@@ -9,6 +9,64 @@ El servidor entrega **los datos y la interfaz**: en el coche solo se teclea la
 dirección y aparece un reproductor. No hay nada que instalar en el vehículo ni
 nada publicado en internet.
 
+## Requisitos
+
+### En el móvil
+
+| | Mínimo | Recomendado |
+|---|---|---|
+| Android | 8.0 (API 26) | 10 (API 29) o superior |
+| RAM del dispositivo | 2 GB | 3 GB o más |
+| Codificador | H.264 por hardware | — |
+| Red | Wi-Fi compartida o hotspot | 5 GHz |
+
+**Android 10 no es capricho: por debajo no hay audio.** `AudioPlaybackCapture`
+es API 29. En 8.0 y 9.0 el vídeo funciona igual y el audio sencillamente no
+existe — el motor lo trata como un extra y su ausencia no tumba la transmisión.
+
+El codificador H.264 por hardware lo tiene cualquier teléfono de esta década.
+Sin él, `MediaCodec` cae a un codificador por software que no sostiene ni 720p30
+y calienta el doble.
+
+### Memoria que usa la app
+
+Medido con `dumpsys meminfo` en un Redmi Note 10 (Android 12):
+
+| Estado | PSS |
+|---|---|
+| Interfaz abierta, sin transmitir | **~60 MB** |
+| Transmitiendo, ajustes por defecto | ~110–130 MB (estimado) |
+| Techo con buffer de 5 s y bitrate sin límite | ~180 MB (estimado) |
+
+Sólo la primera fila está medida. Las otras dos son el baseline medido más lo
+que el código reserva, que sí es determinista:
+
+- **Ventana de segmentos de vídeo**: `bitrate ÷ 8 × buffer × 2,5`, acotada entre
+  2 y **48 MB**. Con los ajustes por defecto (1080p60, calidad Alta, buffer 2 s)
+  salen ~16 MB.
+- **Ventana de audio**: `bitrate ÷ 8 × buffer × 3`, mínimo 256 KB. Nunca pasa de
+  ~1 MB.
+- **Codificador y `VirtualDisplay`**: memoria gráfica del sistema, no del montón
+  de la app. Depende del chip.
+
+El tope de bytes es el que manda, no el número de segmentos: con el bitrate sin
+límite un segmento puede ser diez veces su tamaño habitual, y contar segmentos
+se convertiría en decenas de megas sin avisar. Nada llega nunca al disco.
+
+No hay fuga: la ventana descarta lo viejo al añadir lo nuevo, y el reproductor
+suelta cada 500 ms lo que quedó más de 3 s por detrás del cabezal.
+
+### En el coche
+
+| Perfil | Requisito |
+|---|---|
+| **A** (fMP4 + MSE) | Navegador con `MediaSource` y decodificador H.264 — en la práctica, uno que reproduzca YouTube web |
+| **B** (MJPEG) | Cualquier cosa que renderice HTML |
+
+No hace falta instalar nada ni tener internet: sólo estar en la misma red que el
+móvil. Si dudas de qué soporta el navegador del vehículo, abre `/probe` desde él
+y la propia app te muestra la respuesta.
+
 ## Stack
 
 | Pieza | Elección |

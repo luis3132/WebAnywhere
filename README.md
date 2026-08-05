@@ -57,6 +57,11 @@ MSE — porque es lo que un navegador viejo sabe hacer aunque no entienda HLS ni
 DASH. Con un perfil MJPEG de reserva que funciona en cualquier cosa que pinte
 HTML.
 
+**Requisitos:** Android 8.0 mínimo, **10 o superior si quieres audio**
+(`AudioPlaybackCapture` es API 29). Usa ~60 MB en reposo y ~130 MB
+transmitiendo. En el coche, un navegador que reproduzca YouTube web basta para
+el perfil bueno; para el de reserva vale cualquiera que pinte HTML.
+
 ```bash
 cd app
 ./gradlew :streamer:installDebug
