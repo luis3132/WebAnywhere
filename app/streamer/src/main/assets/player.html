@@ -284,34 +284,49 @@
 
   function syncFsUi() {
     var inFs = fsActive();
-    fsBtn.style.display =
-      (playing && !connectionLost && !inFs && !!fsRequestFn()) ? 'block' : 'none';
-    if (!inFs) { hideExit(); }
+    var live = playing && !connectionLost;
+
+    fsBtn.style.display = (live && !inFs && !!fsRequestFn()) ? 'block' : 'none';
+
+    /* Al entrar en pantalla completa esto esconde los dos; al salir, solo el
+       de salir, porque hideControls no toca el de estadisticas fuera de
+       pantalla completa. */
+    hideControls();
+    if (!inFs) { statsBtn.style.display = live ? 'block' : 'none'; }
   }
 
-  var exitTimer = null;
+  /* Los controles de pantalla completa van juntos.
+     ---------------------------------------------------------------
+     En pantalla completa la imagen es el contenido y cualquier boton encima
+     estorba, asi que no queda ninguno a la vista y el propio video responde
+     al toque. Pero entonces tienen que aparecer *todos*: revelar solo el de
+     salir dejaria las estadisticas inalcanzables sin salir antes.
 
-  function showExit() {
+     Fuera de pantalla completa el de estadisticas se queda fijo — ahi hay
+     sitio de sobra y esconderlo solo lo haria dificil de encontrar. */
+  var controlsTimer = null;
+
+  function showControls() {
     exitWrap.style.display = 'block';
-    if (exitTimer) { clearTimeout(exitTimer); }
-    exitTimer = setTimeout(hideExit, 4000);
+    statsBtn.style.display = 'block';
+    if (controlsTimer) { clearTimeout(controlsTimer); }
+    controlsTimer = setTimeout(hideControls, 4000);
   }
 
-  function hideExit() {
+  function hideControls() {
     exitWrap.style.display = 'none';
-    if (exitTimer) { clearTimeout(exitTimer); exitTimer = null; }
+    if (fsActive()) { statsBtn.style.display = 'none'; }
+    if (controlsTimer) { clearTimeout(controlsTimer); controlsTimer = null; }
   }
 
   fsBtn.onclick = function () { enterFs(); };
   exitBtn.onclick = function () { leaveFs(); };
 
-  /* En pantalla completa no queda ningun control a la vista, asi que el
-     propio video es el que responde al toque. */
   stage.onclick = function (ev) {
     var target = ev && (ev.target || ev.srcElement);
     if (target && target.tagName === 'BUTTON') { return; }
     if (!fsActive()) { return; }
-    if (exitWrap.style.display === 'block') { hideExit(); } else { showExit(); }
+    if (exitWrap.style.display === 'block') { hideControls(); } else { showControls(); }
   };
 
   var fsEvents = ['fullscreenchange', 'webkitfullscreenchange',
@@ -411,7 +426,7 @@
     endedText.innerHTML = '';
     endedText.appendChild(document.createTextNode(reason));
 
-    hideExit();
+    hideControls();
     leaveFs();
     syncFsUi();
     statsBtn.style.display = 'none';
@@ -1140,6 +1155,10 @@
   statsBtn.onclick = function (ev) {
     if (ev && ev.stopPropagation) { ev.stopPropagation(); }
     toggleStats();
+    /* Reinicia la cuenta atras: si no, el boton se esconderia cuatro
+       segundos despues del toque que revelo los controles, y cerrar el panel
+       obligaria a tocar la pantalla otra vez para hacerlo reaparecer. */
+    if (fsActive()) { showControls(); }
   };
 
   /* Se construye aqui y no arriba: `var` iza la declaracion pero no el
