@@ -13,6 +13,10 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import com.webanywhere.streamer.MainActivity
 import com.webanywhere.streamer.R
 import com.webanywhere.streamer.StreamConfig
@@ -40,24 +44,57 @@ class StreamerService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
-    private val teardownLock = Any()
+    /**
+     * Every start and stop runs here, in order, one at a time.
+     *
+     * Neither operation is quick — `StreamServer.stop` drains in-flight requests
+     * for up to two seconds and the media stack blocks while it releases
+     * encoders — so neither can run on the main thread. But once they are off
+     * it, they can also overlap, and that is what broke restarting: a start
+     * arriving while the previous session was still tearing down found `engine`
+     * not yet null, gave up, and was then finished off by the teardown's own
+     * `stopSelf`. From the user's side the consent dialog was accepted and
+     * nothing happened.
+     *
+     * A single worker makes the order the obvious one: a start queued behind a
+     * stop begins after the stop has finished.
+     */
+    private val lifecycle: ExecutorService =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "streamer-lifecycle") }
+
+    /**
+     * Starts asked for but not yet carried out. `stopEverything` reads it to
+     * decide whether dropping out of the foreground is still the right thing to
+     * do, because a queued start has already put the notification back up.
+     */
+    private val pendingStarts = AtomicInteger(0)
 
     @Volatile
-    private var teardownThread: Thread? = null
+    private var stopping = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> handleStart(intent)
-            ACTION_STOP -> stopAsync()
+            ACTION_START -> handleStart(intent, startId)
+            ACTION_STOP -> stopAsync(startId)
         }
         return START_NOT_STICKY
     }
 
-    private fun handleStart(intent: Intent) {
-        if (engine != null) return
+    /**
+     * The user swiped the app away from the recents list. That is an explicit
+     * "close this", not the app-switching the mirror is meant to survive — so
+     * the stream, the notification and the service go with it. Without this the
+     * projection kept running with no window left to stop it from.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.i(TAG, "task removed, shutting the stream down")
+        stopAsync(STOP_ANY_START_ID)
+        super.onTaskRemoved(rootIntent)
+    }
 
+    private fun handleStart(intent: Intent, startId: Int) {
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
         val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
@@ -68,16 +105,61 @@ class StreamerService : Service() {
 
         if (resultData == null) {
             Log.e(TAG, "no projection consent payload")
-            stopSelf()
+            stopSelf(startId)
             return
         }
 
         val config = StreamHub.config
 
-        // Order matters on Android 14+: the service must already be in the
-        // foreground with the mediaProjection type before the projection token
-        // is redeemed, or the system throws.
+        stopping = false
+        pendingStarts.incrementAndGet()
+
+        // Has to happen here rather than on the worker: the system gives a
+        // service started with startForegroundService a few seconds to enter the
+        // foreground, and queueing behind a teardown could burn them. It also
+        // has to happen before the projection token is redeemed — on Android 14+
+        // the service must already be foreground with the mediaProjection type,
+        // or the redemption throws.
         startForegroundNotification(config)
+
+        val queued = submit {
+            val started = try {
+                startEverything(resultCode, resultData, config)
+            } catch (e: Exception) {
+                Log.e(TAG, "could not start the stream", e)
+                StreamHub.updateStats { it.copy(lastError = "No se pudo iniciar: ${e.message}") }
+                false
+            }
+
+            // Decremented before the cleanup, not after: `stopEverything` reads
+            // it to decide whether the notification still belongs to somebody,
+            // and a failed start no longer has any claim on it.
+            pendingStarts.decrementAndGet()
+
+            if (!started) {
+                stopEverything()
+                stopSelf(startId)
+            }
+        }
+
+        if (!queued) {
+            pendingStarts.decrementAndGet()
+            stopSelf(startId)
+        }
+    }
+
+    /** Returns false when the service is already on its way out. */
+    private fun submit(task: () -> Unit): Boolean =
+        runCatching { lifecycle.execute(task) }
+            .onFailure { Log.w(TAG, "lifecycle worker is gone, dropping the request", it) }
+            .isSuccess
+
+    private fun startEverything(
+        resultCode: Int,
+        resultData: Intent,
+        config: StreamConfig,
+    ): Boolean {
+        if (engine != null) return true
 
         val manager = getSystemService(MediaProjectionManager::class.java)
         val projection = try {
@@ -85,20 +167,37 @@ class StreamerService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "projection rejected", e)
             StreamHub.updateStats { it.copy(lastError = "Proyección rechazada: ${e.message}") }
-            stopSelf()
-            return
+            return false
         }
 
         if (projection == null) {
-            stopSelf()
-            return
+            Log.e(TAG, "projection consent produced no session")
+            return false
         }
+
+        // Before anything can publish into them: whatever the last run left in
+        // the rings sits on sequence numbers this run is about to reuse.
+        StreamHub.beginSession()
 
         acquireLocks()
 
-        engine = StreamerEngine(applicationContext, projection, config).also {
-            StreamHub.engine = it
-        }
+        engine = StreamerEngine(
+            context = applicationContext,
+            projection = projection,
+            config = config,
+            // Revoking the capture from the system UI used to leave the service
+            // running with a notification, two locks and a bound port for a
+            // session that no longer existed — and holding an engine, which
+            // made every later start a no-op.
+            onProjectionLost = {
+                Log.i(TAG, "projection lost, stopping the service")
+                StreamHub.updateStats {
+                    it.copy(lastError = "La captura de pantalla se detuvo desde el sistema.")
+                }
+                stopAsync(STOP_ANY_START_ID)
+            },
+        ).also { StreamHub.engine = it }
+
         server = StreamServer(applicationContext, config).also {
             runCatching { it.start() }.onFailure { error ->
                 Log.e(TAG, "server failed to bind port ${config.port}", error)
@@ -111,54 +210,62 @@ class StreamerService : Service() {
         StreamHub.updateStats {
             it.copy(running = true, urls = NetInfo.urls(config.port), lastError = null)
         }
+        return true
     }
 
     /**
-     * `onStartCommand` runs on the main thread, and tearing this down is not a
-     * quick operation: `StreamServer.stop` waits for in-flight requests to
-     * drain (up to two seconds by contract), and releasing the encoders blocks
-     * on the media stack. Doing that inline froze the UI for ~700 ms.
-     *
-     * So the flag that the UI watches is flipped straight away and the actual
-     * teardown moves to its own thread, which calls `stopSelf` when it is done.
-     * The notification is dismissed there too, not here: dropping out of the
-     * foreground while the projection is still alive is exactly what Android 14
-     * penalises.
+     * The flag the UI watches is flipped straight away; the real teardown is
+     * queued. The notification is dismissed there too, not here: dropping out of
+     * the foreground while the projection is still alive is exactly what
+     * Android 14 penalises.
      */
-    private fun stopAsync() {
+    private fun stopAsync(startId: Int) {
+        if (stopping) return
+        stopping = true
+
         StreamHub.updateStats { it.copy(running = false, urls = emptyList()) }
 
-        val thread = Thread({
+        submit {
             stopEverything()
-            stopSelf()
-        }, "streamer-teardown")
-
-        teardownThread = thread
-        thread.start()
+            // Passing the id rather than calling the bare stopSelf(): if a new
+            // start has arrived in the meantime this becomes a no-op instead of
+            // killing the session the user has just asked for.
+            if (startId == STOP_ANY_START_ID) stopSelf() else stopSelf(startId)
+        }
     }
 
-    private fun stopEverything() = synchronized(teardownLock) {
-        server?.stop()
+    /** Runs on [lifecycle], so it is never concurrent with a start. */
+    private fun stopEverything() {
+        // The engine goes out of reach first: an HTTP handler picking it up now
+        // would be acquiring pipelines on a session that is being dismantled.
+        StreamHub.engine = null
+
+        runCatching { server?.stop() }.onFailure { Log.w(TAG, "server stop failed", it) }
         server = null
 
-        engine?.shutdown()
+        runCatching { engine?.shutdown() }.onFailure { Log.w(TAG, "engine shutdown failed", it) }
         engine = null
-        StreamHub.engine = null
 
         releaseLocks()
 
         StreamHub.updateStats { it.copy(running = false, urls = emptyList()) }
-        stopForeground(STOP_FOREGROUND_REMOVE)
+
+        // A start already queued has put the notification back up; tearing it
+        // down here would leave that session foreground-less.
+        if (pendingStarts.get() == 0) {
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        }
     }
 
     override fun onDestroy() {
-        // On the normal path the teardown thread has already finished — it is
-        // what called stopSelf. This only actually waits when the system is
-        // destroying the service out from under us, and there the cleanup has
-        // to happen regardless.
-        teardownThread?.join(3_000)
-        teardownThread = null
-        stopEverything()
+        // On the normal path the teardown has already run — it is what called
+        // stopSelf. This matters when the system destroys the service out from
+        // under us, and there the cleanup has to happen regardless.
+        stopping = true
+        pendingStarts.set(0)
+        submit { stopEverything() }
+        lifecycle.shutdown()
+        runCatching { lifecycle.awaitTermination(TEARDOWN_TIMEOUT_S, TimeUnit.SECONDS) }
         super.onDestroy()
     }
 
@@ -244,6 +351,16 @@ class StreamerService : Service() {
         private const val TAG = "StreamerService"
         private const val CHANNEL_ID = "streaming"
         private const val NOTIFICATION_ID = 42
+
+        /**
+         * Stop unconditionally, for the paths with no start id of their own —
+         * the projection dying, the task being swiped away. Any negative value
+         * would do; -1 just reads as "not a real id".
+         */
+        private const val STOP_ANY_START_ID = -1
+
+        /** How long onDestroy waits for a teardown already in flight. */
+        private const val TEARDOWN_TIMEOUT_S = 3L
 
         /** Long, but not infinite: a stuck stream should not hold the CPU forever. */
         private const val WAKELOCK_TIMEOUT_MS = 4 * 60 * 60 * 1000L

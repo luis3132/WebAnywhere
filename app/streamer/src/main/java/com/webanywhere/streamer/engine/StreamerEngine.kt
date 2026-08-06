@@ -2,7 +2,6 @@ package com.webanywhere.streamer.engine
 
 import android.content.Context
 import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -21,6 +20,7 @@ import com.webanywhere.streamer.encode.VideoEncoder
 import com.webanywhere.streamer.mux.Fmp4
 import com.webanywhere.streamer.mux.Fmp4Track
 import com.webanywhere.streamer.stream.SegmentRing
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -49,21 +49,40 @@ class StreamerEngine(
     private val context: Context,
     private val projection: MediaProjection,
     private val config: StreamConfig,
+    /**
+     * Called when the projection dies on its own — the user revoked it from the
+     * system UI, or Android took it away. Without this the service kept its
+     * notification, its wake locks and its port for a session that no longer
+     * existed, and refused to start a new one because it still held an engine.
+     */
+    private val onProjectionLost: () -> Unit = {},
 ) {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    /**
+     * Nothing in here is worth killing the process over.
+     *
+     * Every background job the engine runs touches the media stack, and the
+     * media stack throws for reasons that are the device's business rather than
+     * ours. A root coroutine that throws goes straight to the thread's uncaught
+     * handler, which on Android means the app disappears — the rotation crash
+     * reached the user exactly this way.
+     */
+    private val errors = CoroutineExceptionHandler { _, error ->
+        Log.e(TAG, "background job failed", error)
+        StreamHub.updateStats { it.copy(lastError = "Fallo interno: ${error.message}") }
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + errors)
     private val capture = ScreenCapture(projection)
     private val lock = Any()
 
     private var videoEncoder: VideoEncoder? = null
-    private var videoDisplay: VirtualDisplay? = null
     private var videoTrack: Fmp4Track? = null
 
     private var audioEncoder: AudioEncoder? = null
     private var audioTrack: Fmp4Track? = null
 
     private var mjpegPipeline: MjpegPipeline? = null
-    private var mjpegDisplay: VirtualDisplay? = null
 
     private var fpsJob: Job? = null
     private val encodedFrames = AtomicLong(0)
@@ -79,8 +98,13 @@ class StreamerEngine(
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
+            // Our own shutdown stops the projection, which lands right back
+            // here. Only the other direction is news worth reporting.
+            if (shuttingDown) return
             Log.i(TAG, "projection revoked by the system or the user")
             shutdown()
+            runCatching { onProjectionLost() }
+                .onFailure { Log.e(TAG, "projection-lost handler failed", it) }
         }
     }
 
@@ -138,38 +162,51 @@ class StreamerEngine(
         }
     }
 
+    /**
+     * Rebuilding here is the one operation in the engine that used to be able to
+     * take the whole app down, so it is wrapped: an encoder that refuses to come
+     * back at the new geometry should cost the picture, not the process.
+     */
     private fun applyRotation() {
         var rebuilt = false
-        synchronized(lock) {
-            if (shuttingDown) return
-            val size = screenSize()
-            if (size.first <= 0 || size.second <= 0) return
+        try {
+            synchronized(lock) {
+                if (shuttingDown) return
+                val size = screenSize()
+                if (size.first <= 0 || size.second <= 0) return
 
-            val previous = capturedScreen ?: return
-            // Comparing the size rather than just portrait-versus-landscape:
-            // this also catches a resolution change, and it is the number the
-            // encoder was actually built from.
-            if (size == previous) return
+                val previous = capturedScreen ?: return
+                // Comparing the size rather than just portrait-versus-landscape:
+                // this also catches a resolution change, and it is the number the
+                // encoder was actually built from.
+                if (size == previous) return
 
-            Log.i(TAG, "screen changed ${previous.first}x${previous.second} -> " +
-                "${size.first}x${size.second}, rebuilding pipelines")
+                Log.i(TAG, "screen changed ${previous.first}x${previous.second} -> " +
+                    "${size.first}x${size.second}, rebuilding pipelines")
 
-            // Only what is actually running: rotating with no clients attached
-            // should not start an encoder that nobody asked for.
-            if (videoEncoder != null) {
-                stopVideo()
-                startVideo()
-                rebuilt = true
+                // Only what is actually running: rotating with no clients attached
+                // should not start an encoder that nobody asked for.
+                if (videoEncoder != null) {
+                    stopVideo()
+                    startVideo()
+                    rebuilt = true
+                }
+                if (mjpegPipeline != null) {
+                    stopMjpeg()
+                    startMjpeg()
+                    rebuilt = true
+                }
+                // If nothing was running there is no pipeline to rebuild, but the
+                // new geometry still has to be recorded or the next rotation would
+                // compare against a size that was never captured.
+                capturedScreen = size
             }
-            if (mjpegPipeline != null) {
-                stopMjpeg()
-                startMjpeg()
-                rebuilt = true
-            }
-            // If nothing was running there is no pipeline to rebuild, but the
-            // new geometry still has to be recorded or the next rotation would
-            // compare against a size that was never captured.
-            capturedScreen = size
+        } catch (e: Exception) {
+            Log.e(TAG, "could not rebuild the pipelines after a rotation", e)
+            StreamHub.updateStats { it.copy(lastError = "Fallo al girar la pantalla: ${e.message}") }
+            // Still worth telling the clients: whatever survived the failure no
+            // longer matches the session they are decoding.
+            rebuilt = true
         }
         // Outside the lock: this wakes up HTTP handlers, and they must not
         // block on a lock the engine is still holding.
@@ -230,11 +267,17 @@ class StreamerEngine(
     fun shutdown() {
         synchronized(lock) {
             if (shuttingDown) return
+            // Set before stopping anything: the projection callback fires while
+            // the teardown below runs, and it must recognise this as our own
+            // doing rather than report the session as lost.
             shuttingDown = true
-            stopVideo()
-            stopMjpeg()
+            // Each step guarded on its own. A codec that refuses to stop must
+            // not strand the projection, the locks or the notification behind
+            // it — that is what left the app half-closed.
+            runCatching { stopVideo() }.onFailure { Log.w(TAG, "stopVideo failed", it) }
+            runCatching { stopMjpeg() }.onFailure { Log.w(TAG, "stopMjpeg failed", it) }
         }
-        capture.releaseAll()
+        runCatching { capture.releaseAll() }
         runCatching { displayManager?.unregisterDisplayListener(displayListener) }
         runCatching { projection.unregisterCallback(projectionCallback) }
         runCatching { projection.stop() }
@@ -324,7 +367,13 @@ class StreamerEngine(
         }
 
         // Zero-copy: the compositor renders straight into the encoder surface.
-        videoDisplay = capture.createDisplay("wa-video", surface, width, height, densityDpi())
+        if (!capture.attach(SLOT_VIDEO, surface, width, height, densityDpi())) {
+            encoder.stop()
+            StreamHub.updateStats {
+                it.copy(lastError = "No se pudo enganchar la captura de pantalla al codificador.")
+            }
+            return
+        }
         videoEncoder = encoder
         videoTrack = track
 
@@ -386,8 +435,9 @@ class StreamerEngine(
         fpsJob?.cancel()
         fpsJob = null
 
-        capture.release(videoDisplay)
-        videoDisplay = null
+        // Unhook before the encoder releases its input surface: the display must
+        // never be left holding a surface that no longer exists.
+        capture.detach(SLOT_VIDEO)
 
         videoEncoder?.stop()
         videoEncoder = null
@@ -483,20 +533,37 @@ class StreamerEngine(
             },
         )
 
-        pipeline.start()
+        try {
+            pipeline.start()
+        } catch (e: Exception) {
+            Log.e(TAG, "MJPEG pipeline failed to start", e)
+            StreamHub.updateStats { it.copy(lastError = "MJPEG: ${e.message}") }
+            pipeline.stop()
+            return
+        }
+
         val surface = pipeline.surface
         if (surface == null) {
             pipeline.stop()
             return
         }
 
-        mjpegDisplay = capture.createDisplay("wa-mjpeg", surface, width, height, densityDpi())
+        if (!capture.attach(SLOT_MJPEG, surface, width, height, densityDpi())) {
+            pipeline.stop()
+            StreamHub.updateStats {
+                it.copy(
+                    lastError = "MJPEG no pudo obtener una pantalla virtual: " +
+                        "Android 14+ solo concede una por permiso de captura, y la " +
+                        "está usando el perfil fMP4.",
+                )
+            }
+            return
+        }
         mjpegPipeline = pipeline
     }
 
     private fun stopMjpeg() {
-        capture.release(mjpegDisplay)
-        mjpegDisplay = null
+        capture.detach(SLOT_MJPEG)
         mjpegPipeline?.stop()
         mjpegPipeline = null
         StreamHub.mjpeg.reset()
@@ -567,6 +634,10 @@ class StreamerEngine(
 
     private companion object {
         const val TAG = "StreamerEngine"
+
+        /** Names the two pipelines use to claim a virtual display. */
+        const val SLOT_VIDEO = "wa-video"
+        const val SLOT_MJPEG = "wa-mjpeg"
 
         /** Microsecond timescale: MediaCodec reports PTS in µs, so no rounding drift. */
         const val VIDEO_TIMESCALE = 1_000_000

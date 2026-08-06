@@ -109,6 +109,13 @@ El perfil B es el seguro de vida: un `<img src="/mjpeg">`, cero JavaScript, cero
 negociación de codecs. Funciona en cualquier cosa que renderice HTML y además es
 inmune a las políticas de autoplay que bloquean `<video>`.
 
+> **En Android 14 o superior, A y B no pueden correr a la vez.** Un permiso de
+> captura concede exactamente un `VirtualDisplay` — la segunda llamada a
+> `createVirtualDisplay` lanza `SecurityException` — y cada perfil necesita el
+> suyo porque graban a resoluciones distintas. El que llegue primero se lo queda;
+> el segundo cliente ve un aviso en la app. Al girar el móvil no se pide otro:
+> se reapunta el que ya hay con `resize` + `setSurface`.
+
 ## Rutas
 
 ```

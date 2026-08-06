@@ -166,9 +166,14 @@ class StreamServer(
 
         when (val result = track.ring.await(sequence, SEGMENT_WAIT_MS)) {
             is SegmentRing.Result.Ready -> {
-                // Segments are immutable once produced, so caching is safe and
-                // spares the link a retransmit if the client re-requests one.
-                call.response.header(HttpHeaders.CacheControl, "public, max-age=300")
+                // Never cached, despite a segment being immutable once
+                // produced. Sequence numbers restart from zero with each
+                // encoder, so `/v/seg/3` means something different after every
+                // rotation and every restart — and a browser that cached the
+                // old one would replay a piece of the previous session,
+                // decoded against an init segment describing another picture.
+                // On a LAN the saved retransmit was worth nothing anyway.
+                call.noStore()
                 // How far behind the client is, at the cost of no extra round
                 // trip. Without this it would have to poll live.json to find
                 // out, and by the time it knew it would be further behind.

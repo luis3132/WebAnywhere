@@ -203,7 +203,23 @@
     ? 'Perfil B (MJPEG). Compatible con todo.'
     : 'Perfil A (fMP4 + MSE). Maxima calidad.');
 
+  var statsTimer = null;
+
   startBtn.onclick = function () {
+    /* Un segundo toque no debe arrancar una segunda sesion en paralelo: en
+       una pantalla tactil de coche el doble toque accidental es la norma. */
+    if (playing) { return; }
+
+    /* Empezar de cero, siempre.
+       ---------------------------------------------------------------
+       Esta pagina sobrevive a la sesion que la trajo: el telefono para y
+       arranca, gira, se rehace el codificador, y la numeracion de segmentos
+       vuelve a empezar en cero cada vez. Lo que quedara del intento anterior
+       — el MediaSource, los SourceBuffer, lo ya descargado — describe un
+       video que ya no existe, y reanudar sobre ello es exactamente lo que
+       daba imagen congelada o negra al pulsar Reproducir. */
+    resetSession(true);
+
     overlay.style.display = 'none';
     playing = true;
     if (hudOn) { hud.style.display = 'block'; }
@@ -211,7 +227,7 @@
     if (statsOn) { statsEl.style.display = 'block'; }
     syncFsUi();
     startHeartbeat();
-    setInterval(updateStats, statsMs);
+    if (!statsTimer) { statsTimer = setInterval(updateStats, statsMs); }
     if (useMjpeg) { startMjpeg(); } else { startMse(); }
   };
 
@@ -378,20 +394,10 @@
   }
 
   function restartStream() {
-    /* Invalida de golpe todos los bucles en vuelo de la sesion anterior. */
-    sessionToken = sessionToken + 1;
-    mediaSourceOpened = false;
-    /* Pertenecen al MediaSource que se va a tirar; conservarlos haria que
-       la poda tocara buffers ya desconectados. */
-    activeBuffers = [];
-    setRate(1);
+    /* Mismo borrado que al pulsar Reproducir, salvo los contadores: para el
+       usuario esto sigue siendo la misma sesion, solo que girada. */
+    resetSession(false);
     setHud('pantalla girada, reconfigurando');
-
-    try { video.pause(); } catch (e) { /* ignorar */ }
-    try {
-      video.removeAttribute('src');
-      video.load();
-    } catch (e) { /* ignorar */ }
 
     /* Un respiro para que el codificador nuevo publique su init antes de
        pedirlo, y para que el WebView suelte el MediaSource anterior. */
@@ -449,12 +455,71 @@
      encoder viejo en el buffer del nuevo. */
   var sessionToken = 0;
 
+  /* Sufijo unico por sesion para las URLs de medios.
+     ---------------------------------------------------------------
+     El servidor ya manda no-store, pero un WebView de coche es justo el
+     software que se toma esa cabecera como una sugerencia. Y aqui equivocarse
+     no da una pagina desactualizada: da el segmento 3 de la sesion anterior,
+     que es medio segundo de otra pantalla, con otra resolucion, decodificado
+     contra un init que describe algo distinto. Cambiando la URL entera no hay
+     cache que acertar. */
+  var cacheBust = '';
+
+  function mediaUrl(path) {
+    return cacheBust ? (path + '?b=' + cacheBust) : path;
+  }
+
+  /**
+   * Tira todo lo que quedaba de la sesion anterior.
+   *
+   * El testigo invalida los bucles que sigan en vuelo dentro de sus XHR; el
+   * resto es memoria del navegador que nadie libera solo. Soltar el src del
+   * <video> y recargarlo es lo que hace que el MediaSource anterior — y con el
+   * todo lo que ya se le habia dado con appendBuffer — se vaya de verdad.
+   *
+   * `fresh` distingue las dos razones para hacer esto: pulsar Reproducir
+   * empieza una medicion nueva, mientras que rehacer la sesion tras un giro es
+   * la misma sesion vista por el usuario y sus contadores deben seguir.
+   */
+  function resetSession(fresh) {
+    sessionToken = sessionToken + 1;
+    mediaSourceOpened = false;
+    /* Pertenecen al MediaSource que se va a tirar; conservarlos haria que la
+       poda tocara buffers ya desconectados. */
+    activeBuffers = [];
+    /* Que la proxima lectura de /status fije la generacion en vez de
+       compararse con la de la sesion muerta y pedir otro reinicio. */
+    streamGeneration = -1;
+    cacheBust = 'b' + nowMs() + '-' + sessionToken;
+
+    setRate(1);
+
+    try { video.pause(); } catch (e) { /* ignorar */ }
+    try {
+      video.removeAttribute('src');
+      video.load();
+    } catch (e) { /* ignorar */ }
+    /* Corta la peticion multipart, que si no sigue abierta para siempre. */
+    try { img.removeAttribute('src'); } catch (e) { /* ignorar */ }
+
+    if (fresh) {
+      tel = {
+        segments: 0, bytes: 0,
+        fetchMs: 0, fetches: 0,
+        gone: 0, misses: 0, errors: 0,
+        resyncs: 0, seeks: 0, stalls: 0, restarts: 0,
+        startedAt: nowMs()
+      };
+      prev = null;
+    }
+  }
+
   function startMse() {
     var token = sessionToken;
     video.style.display = 'block';
     setHud('fMP4/MSE conectando');
 
-    xhrJson('/v/live.json', function (status, info) {
+    xhrJson(mediaUrl('/v/live.json'), function (status, info) {
       if (token !== sessionToken) { return; }
       if (status !== 200 || !info) {
         setHud('sin servidor, reintentando');
@@ -483,7 +548,7 @@
       }
 
       if (wantAudio) {
-        xhrJson('/a/live.json', function (aStatus, aInfo) {
+        xhrJson(mediaUrl('/a/live.json'), function (aStatus, aInfo) {
           if (token !== sessionToken) { return; }
           openMediaSource(token, mime, info,
             (aStatus === 200 && aInfo && aInfo.ready) ? aInfo : null);
@@ -559,7 +624,7 @@
        navegador se quejaba. */
     activeBuffers.push(sourceBuffer);
 
-    xhrBin(base + 'init.mp4', function (status, buffer) {
+    xhrBin(mediaUrl(base + 'init.mp4'), function (status, buffer) {
       if (token !== sessionToken) { return; }
       if (status !== 200 || !buffer) {
         setTimeout(function () {
@@ -576,7 +641,7 @@
     function loop() {
       if (token !== sessionToken) { return; }
       var sentAt = nowMs();
-      xhrBin(base + 'seg/' + next + '.m4s', function (status, buffer, xhr) {
+      xhrBin(mediaUrl(base + 'seg/' + next + '.m4s'), function (status, buffer, xhr) {
         if (token !== sessionToken) { return; }
 
         if (status === 200 && buffer) {
@@ -634,7 +699,7 @@
     function resync() {
       if (token !== sessionToken) { return; }
       tel.resyncs = tel.resyncs + 1;
-      xhrJson(base + 'live.json', function (status, info) {
+      xhrJson(mediaUrl(base + 'live.json'), function (status, info) {
         if (token !== sessionToken) { return; }
         if (status === 200 && info && info.latest >= 0) {
           applyTiming(info);

@@ -172,4 +172,28 @@ object StreamHub {
         _clients.clear()
         _clientList.value = emptyList()
     }
+
+    /**
+     * Wipes everything the previous run left behind, right before a new one
+     * starts.
+     *
+     * Segment numbering restarts from zero with each encoder, so anything still
+     * held from the last session occupies sequence numbers the new session is
+     * about to reuse — a client asking for segment 3 would be handed three
+     * seconds of yesterday's screen, decoded against an init segment that
+     * describes a different picture. The counters go too: a stats panel that
+     * carries totals across sessions is reporting on a stream nobody is
+     * watching any more.
+     *
+     * [bumpGeneration] is what tells clients still holding the old session to
+     * throw it away instead of resuming into the new one.
+     */
+    fun beginSession() {
+        reset()
+        // Probe reports survive on purpose: what the car's browser can do does
+        // not change between sessions, and it is the one thing here worth
+        // keeping to compare against.
+        _stats.value = Stats()
+        bumpGeneration()
+    }
 }
